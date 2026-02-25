@@ -1,74 +1,78 @@
 # CorridorKeyModule
 
-A self-contained, high-performance AI Chroma Keying engine. This module provides a simple API to access the `CorridorKey` architecture (Hiera Backbone + CNN Refiner) for verifying and processing green screen footage.
+A self-contained, high-performance AI Chroma Keying engine. This module provides a simple API to access the `CorridorKey` architecture (Hiera Backbone + CNN Refiner) for processing green screen footage.
 
 ## Features
-*   **Resolution Independent:** Automatically resizes internal model embeddings to match your requested processing resolution (default 2048p).
-*   **High Fidelity:** Preserves original input resolution using Lanczos4 resampling.
-*   **Robust:** Handles Linear (EXR) and sRGB (PNG/MP4) inputs automatically.
+*   **Resolution Independent:** Automatically resizes input images to match the native training resolution of the model (2048x2048).
+*   **High Fidelity:** Preserves original input resolution using Lanczos4 resampling for final output.
+*   **Robust:** Supports explicit configurations for Linear (EXR) and sRGB (PNG/MP4) source inputs.
 
 ## Installation
 
-1. Copy the `CorridorKeyModule` folder to your project root.
-2. Install dependencies:
-   ```bash
-   pip install -r CorridorKeyModule/requirements.txt
-   ```
-   *(Requires PyTorch, NumPy, OpenCV, Timm)*
+Dependencies for the engine are managed in the main project root `requirements.txt`.  
+*(Requires PyTorch, NumPy, OpenCV, Timm)*
 
-## Usage
+## Usage (GUI Wizard)
+
+For most users, the easiest way to interact with the module is through the included wizard:
+`clip_manager.py` (or dragging and dropping folders onto the `.bat` / `.sh` scripts).
+The wizard handles finding the latest `.pth` checkpoint automatically, prompting for configuration (gamma, despill strength, despeckling), and batch processing entire sequences.
+
+## Usage (Python API)
 
 ### 1. Initialization
-Initialize the engine once. Point it to your `.pth` checkpoint. You can specify the internal processing resolution (e.g., `2048` for quality, `1024` for speed).
+Initialize the engine once. Point it to your `.pth` checkpoint. The engine is hardcoded to process at 2048x2048, representing the data it was trained on.
 
 ```python
 from CorridorKeyModule import CorridorKeyEngine
 
 # Initialize standard engine (CUDA)
-# It will resize the checkpoint's Positional Embeddings to match 'img_size'
 engine = CorridorKeyEngine(
-    checkpoint_path="models/greenformer_v1.pth", 
+    checkpoint_path="models/latest_model.pth", 
     device='cuda', 
     img_size=2048
 )
 ```
 
 ### 2. Processing a Frame
-The engine expects:
-*   **Image:** sRGB Numpy Array (H, W, 3). Range `0.0-1.0` (float) or `0-255` (uint8).
-*   **Mask:** Linear Alpha Mask (H, W). Range `0.0-1.0` (float) or `0-255` (uint8).
+The engine expects inputs as Numpy Arrays (`H, W, Channels`).
+*   It natively processes in **32-bit float** (`0.0 - 1.0`).
+*   If you pass an **8-bit integer** (`0 - 255`) array, the engine will automatically normalize it to `0.0 - 1.0` floats for you. 
+*   If you pass a **16-bit or 32-bit float** array (like an EXR), it will process it at full precision without downgrading.
 
 ```python
 import cv2
+import os
 
-# Load Image (sRGB)
-img = cv2.imread("input.jpg")
-img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+# Enable EXR Support in OpenCV
+os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 
-# Load Coarse Mask (Linear)
-mask = cv2.imread("mask.png", cv2.IMREAD_GRAYSCALE)
+# Load Image (Linear EXR - Read as 32-bit Float)
+img_linear = cv2.imread("input.exr", cv2.IMREAD_UNCHANGED)
+img_linear_rgb = cv2.cvtColor(img_linear, cv2.COLOR_BGR2RGB)
+
+# Load Coarse Mask (Linear EXR - Read as 32-bit Float)
+mask = cv2.imread("mask.exr", cv2.IMREAD_UNCHANGED)
+if mask.ndim == 3: 
+    mask = mask[:,:,0] # Keep single channel
 
 # Process
-# Returns dictionary keys: 'alpha', 'fg', 'comp'
-result = engine.process_frame(img, mask)
+result = engine.process_frame(
+    img_linear_rgb, 
+    mask,
+    input_is_linear=True, # Critical: Tell the engine this is a Linear EXR
+)
 
-# Save Results
-# 'alpha' is Linear 0-1 float
-# 'fg' is sRGB 0-1 float
-alpha_uint8 = (result['alpha'] * 255).astype('uint8')
-fg_uint8 = (result['fg'] * 255).astype('uint8')
+# Save Results (Preserving Float Precision as EXR)
+# 'processed' contains the final RGBA composite (Linear 0-1 float)
+proc_rgba = result['processed']
+proc_bgra = cv2.cvtColor(proc_rgba, cv2.COLOR_RGBA2BGRA)
 
-cv2.imwrite("output_alpha.png", alpha_uint8)
-cv2.imwrite("output_fg.png", cv2.cvtColor(fg_uint8, cv2.COLOR_RGB2BGR))
+exr_flags = [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_HALF, cv2.IMWRITE_EXR_COMPRESSION, cv2.IMWRITE_EXR_COMPRESSION_PXR24]
+cv2.imwrite("output_processed.exr", proc_bgra, exr_flags)
 ```
 
-## Advanced
-
-*   **Refiner Scale:** You can adjust the strength of the detail refiner at inference time (default 1.0).
-    ```python
-    result = engine.process_frame(img, mask, refiner_scale=1.5)
-    ```
-
 ## Module Structure
-*   `inference_engine.py`: Main API wrapper. Handles normalization, tensor conversion, and resizing.
-*   `core/`: Internal model definitions (`model_transformer.py`), color logic (`color_utils.py`), and dependencies.
+*   `inference_engine.py`: The main API wrapper class `CorridorKeyEngine`. Handles automated input normalization (uint8 to float), tensor conversions, memory transfer, resizing to/from the 2K processing resolution, and packing the final analytical passes (RG, Alpha, Processed EXR, and Comp overlays).
+*   `core/model_transformer.py`: The architecture definition for the PyTorch model, combining the Hiera backbone and the convolutional refiner head.
+*   `core/color_utils.py`: Custom digital compositing math utilities, including logic for luminance-preserving despilling, straight/premultiplied compositing algorithms, true sRGB gamma conversions, and connected-components morphological matte cleaning.

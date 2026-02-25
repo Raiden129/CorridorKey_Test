@@ -1,5 +1,0 @@
-# CorridorKeyModule Requirements
-torch>=2.0.0
-numpy
-opencv-python
-timm==1.0.24
