@@ -298,11 +298,19 @@ def main() -> None:
         default="auto",
         help="Compute device (default: auto-detect CUDA > MPS > CPU)",
     )
+    parser.add_argument(
+        "--backend",
+        choices=["auto", "torch", "torch_optimized", "mlx"],
+        default="auto",
+        help="Inference backend (default: auto). torch_optimized uses tiled "
+        "refiner and memory hygiene to reduce VRAM from ~22.7GB to <8GB.",
+    )
 
     args = parser.parse_args()
 
     device = resolve_device(args.device)
-    logger.info(f"Using device: {device}")
+    backend = args.backend
+    logger.info(f"Using device: {device}, backend: {backend}")
 
     try:
         if args.action == "list":
@@ -312,7 +320,7 @@ def main() -> None:
             generate_alphas(clips, device=device)
         elif args.action == "run_inference":
             clips = scan_clips()
-            run_inference(clips, device=device)
+            run_inference(clips, device=device, backend=backend)
         elif args.action == "wizard":
             if not args.win_path:
                 print("Error: --win_path required for wizard.")
