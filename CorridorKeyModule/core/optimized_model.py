@@ -23,14 +23,14 @@ The model loads the same .pth checkpoint as the original GreenFormer.
 from __future__ import annotations
 
 import math
+import types
 
-import timm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .model_transformer import CNNRefinerModule, DecoderHead
-
+from ..optimization_config import OptimizationConfig
+from .model_transformer import CNNRefinerModule, GreenFormer
 
 # ---------------------------------------------------------------------------
 # Fix: Patch Hiera's global attention to use FlashAttention-compatible shapes
@@ -55,8 +55,6 @@ def _patch_hiera_global_attention(hiera: nn.Module) -> int:
 
     Returns the number of blocks patched.
     """
-    import types
-
     patched = 0
     for blk in hiera.blocks:
         attn = blk.attn
@@ -74,9 +72,7 @@ def _patch_hiera_global_attention(hiera: nn.Module) -> int:
                 q, k, v = qkv.unbind(0)  # each [B, heads, N, head_dim]
 
                 if self.q_stride > 1:
-                    q = q.view(
-                        B, self.heads, self.q_stride, -1, self.head_dim
-                    ).amax(dim=2)
+                    q = q.view(B, self.heads, self.q_stride, -1, self.head_dim).amax(dim=2)
 
                 # Ensure contiguous for FlashAttention
                 q = q.contiguous()
@@ -150,9 +146,7 @@ class LTRM(nn.Module):
         self.norm = nn.LayerNorm(dim)
         self.fc1 = nn.Linear(dim, hidden)
         self.act1 = nn.GELU()
-        self.dw_conv = nn.Conv2d(
-            hidden, hidden, kernel_size=dw_kernel, padding=dw_kernel // 2, groups=hidden
-        )
+        self.dw_conv = nn.Conv2d(hidden, hidden, kernel_size=dw_kernel, padding=dw_kernel // 2, groups=hidden)
         self.act2 = nn.GELU()
         self.fc2 = nn.Linear(hidden, dim)
         self.eca = ECA(dim)
@@ -244,9 +238,7 @@ class HintBasedTokenRouter:
                        False = easy token (goes to LTRM).
         """
         # Downsample hint to token resolution using area interpolation
-        hint_down = F.interpolate(
-            alpha_hint, size=(spatial_h, spatial_w), mode="area"
-        )  # [B, 1, H, W]
+        hint_down = F.interpolate(alpha_hint, size=(spatial_h, spatial_w), mode="area")  # [B, 1, H, W]
         hint_flat = hint_down.flatten(1)  # [B, H*W]
 
         edge_mask = (hint_flat > self.threshold_low) & (hint_flat < self.threshold_high)
@@ -363,9 +355,7 @@ class TiledCNNRefiner(CNNRefinerModule):
                 tile_delta = self._process_tile(tile)
 
                 tile_h, tile_w = tile_delta.shape[2], tile_delta.shape[3]
-                blend_w = self._create_blend_weight(
-                    tile_h, tile_w, self.tile_overlap, img.device, img.dtype
-                )
+                blend_w = self._create_blend_weight(tile_h, tile_w, self.tile_overlap, img.device, img.dtype)
 
                 delta_sum[:, :, y0_adj:y1, x0_adj:x1] += tile_delta * blend_w
                 weight_sum[:, :, y0_adj:y1, x0_adj:x1] += blend_w
@@ -379,24 +369,17 @@ class TiledCNNRefiner(CNNRefinerModule):
 # ---------------------------------------------------------------------------
 
 
-class OptimizedGreenFormer(nn.Module):
-    """VRAM-optimized GreenFormer with tiled refiner and optional token routing.
+class OptimizedGreenFormer(GreenFormer):
+    """VRAM-optimized GreenFormer with optional token routing.
 
-    Drop-in replacement for GreenFormer.  Loads the same .pth checkpoint.
+    Extends :class:`GreenFormer` — inherits the encoder, decoders, and
+    refiner setup (including config-driven FlashAttention patching and
+    tiled refiner).  This subclass only adds the token-routing machinery
+    (LTRM modules + HintBasedTokenRouter).
 
-    Default mode (``use_token_routing=False``):
-      - Hiera encoder runs identically to the original (SDPA/FlashAttention
-        already eliminates the N x N attention matrix from VRAM).
-      - CNN Refiner processes in overlapping 512x512 tiles (~92% VRAM savings).
-      - cuDNN benchmark disabled, CUDA cache cleared between stages.
-
-    Experimental mode (``use_token_routing=True``):
-      - Stages 2-3 route "easy" tokens to LTRM, only edge tokens attend.
-      - **Requires fine-tuning** -- zero-shot routing causes a distribution
-        shift because edge tokens lose the background context they were
-        trained to attend to.  LTRM weights are zero-initialized so they
-        initially contribute nothing, but the reduced attention pool itself
-        changes outputs.
+    When ``config.token_routing`` is ``False`` (default), the forward pass
+    delegates entirely to the parent class and behaviour is identical to
+    ``GreenFormer`` with the ``optimized`` config profile.
     """
 
     def __init__(
@@ -405,76 +388,49 @@ class OptimizedGreenFormer(nn.Module):
         in_channels: int = 4,
         img_size: int = 2048,
         use_refiner: bool = True,
-        # Token routing (OFF by default -- needs fine-tuning)
+        optimization_config: OptimizationConfig | None = None,
+        # Legacy params (backward compat -- used only when config is None)
         use_token_routing: bool = False,
         edge_threshold_low: float = 0.02,
         edge_threshold_high: float = 0.98,
         min_edge_tokens: int = 64,
-        # Tiling parameters
         tile_size: int = 512,
         tile_overlap: int = 128,
     ) -> None:
-        super().__init__()
-        self.img_size = img_size
-        self.in_channels = in_channels
-        self.use_token_routing = use_token_routing
+        if optimization_config is None:
+            optimization_config = OptimizationConfig(
+                flash_attention=True,
+                tiled_refiner=True,
+                disable_cudnn_benchmark=True,
+                cache_clearing=True,
+                token_routing=use_token_routing,
+                tile_size=tile_size,
+                tile_overlap=tile_overlap,
+                edge_threshold_low=edge_threshold_low,
+                edge_threshold_high=edge_threshold_high,
+                min_edge_tokens=min_edge_tokens,
+            )
 
-        # --- Encoder (identical to original) ---
-        print(f"[Optimized] Initializing {encoder_name} (img_size={img_size})...")
-        self.encoder = timm.create_model(
-            encoder_name, pretrained=False, features_only=True, img_size=img_size
+        super().__init__(
+            encoder_name=encoder_name,
+            in_channels=in_channels,
+            img_size=img_size,
+            use_refiner=use_refiner,
+            optimization_config=optimization_config,
         )
-        print("Skipped downloading base weights (relying on custom checkpoint).")
 
-        if in_channels != 3:
-            self._patch_input_layer(in_channels)
-
-        # Fix global-attention blocks to use FlashAttention-compatible 4D shapes
-        n_patched = _patch_hiera_global_attention(self.encoder.model)
-        if n_patched:
-            print(f"[Optimized] Patched {n_patched} global-attention blocks for FlashAttention.")
-
-        try:
-            feature_channels = self.encoder.feature_info.channels()
-        except (AttributeError, TypeError):
-            feature_channels = [112, 224, 448, 896]
-        print(f"Feature Channels: {feature_channels}")
-
-        # --- Identify Hiera internals ---
-        hiera = self.encoder.model
-        self._stage_ends = list(hiera.stage_ends)  # [1, 4, 20, 23]
-        self._patch_stride = hiera.patch_stride  # (4, 4)
-
-        # Compute spatial token dims at each stage
-        tokens_h = img_size // self._patch_stride[0]
-        tokens_w = img_size // self._patch_stride[1]
-        self._stage_token_shapes = []
-        for i in range(len(self._stage_ends)):
-            self._stage_token_shapes.append((tokens_h, tokens_w))
-            if i < hiera.q_pool:
-                tokens_h //= hiera.q_stride[0]
-                tokens_w //= hiera.q_stride[1]
-
-        # Stages 2 and 3 use global attention -- routing targets
-        self._stage2_shape = self._stage_token_shapes[2]
-        self._stage3_shape = self._stage_token_shapes[3]
-
-        # --- LTRM modules (only allocated when routing is enabled) ---
-        if self.use_token_routing:
+        # --- Token routing (only allocated when enabled) ---
+        if self.config.token_routing:
             stage2_blocks = self._stage_ends[2] - self._stage_ends[1]  # 16
             stage3_blocks = self._stage_ends[3] - self._stage_ends[2]  # 3
 
-            self.ltrm_stage2 = nn.ModuleList(
-                [LTRM(dim=feature_channels[2]) for _ in range(stage2_blocks)]
-            )
-            self.ltrm_stage3 = nn.ModuleList(
-                [LTRM(dim=feature_channels[3]) for _ in range(stage3_blocks)]
-            )
+            self.ltrm_stage2 = nn.ModuleList([LTRM(dim=self._feature_channels[2]) for _ in range(stage2_blocks)])
+            self.ltrm_stage3 = nn.ModuleList([LTRM(dim=self._feature_channels[3]) for _ in range(stage3_blocks)])
 
             self.router = HintBasedTokenRouter(
-                threshold_low=edge_threshold_low,
-                threshold_high=edge_threshold_high,
-                min_edge_tokens=min_edge_tokens,
+                threshold_low=self.config.edge_threshold_low,
+                threshold_high=self.config.edge_threshold_high,
+                min_edge_tokens=self.config.min_edge_tokens,
             )
             print("[Optimized] Token routing ENABLED (experimental, needs fine-tuning).")
         else:
@@ -483,60 +439,8 @@ class OptimizedGreenFormer(nn.Module):
             self.router = None
             print("[Optimized] Token routing DISABLED (using SDPA for efficient attention).")
 
-        # --- Decoders (identical to original) ---
-        embedding_dim = 256
-        self.alpha_decoder = DecoderHead(feature_channels, embedding_dim, output_dim=1)
-        self.fg_decoder = DecoderHead(feature_channels, embedding_dim, output_dim=3)
-
-        # --- Refiner (tiled) ---
-        self.use_refiner = use_refiner
-        if self.use_refiner:
-            self.refiner = TiledCNNRefiner(
-                in_channels=7,
-                hidden_channels=64,
-                out_channels=4,
-                tile_size=tile_size,
-                tile_overlap=tile_overlap,
-            )
-        else:
-            self.refiner = None
-            print("[Optimized] Refiner Module DISABLED.")
-
-    def _patch_input_layer(self, in_channels: int) -> None:
-        """Identical to GreenFormer._patch_input_layer."""
-        try:
-            patch_embed = self.encoder.model.patch_embed.proj
-        except AttributeError:
-            patch_embed = self.encoder.patch_embed.proj
-        weight = patch_embed.weight.data
-        bias = patch_embed.bias.data if patch_embed.bias is not None else None
-
-        out_channels, _, k, _ = weight.shape
-
-        new_conv = nn.Conv2d(
-            in_channels,
-            out_channels,
-            kernel_size=k,
-            stride=patch_embed.stride,
-            padding=patch_embed.padding,
-            bias=(bias is not None),
-        )
-
-        new_conv.weight.data[:, :3, :, :] = weight
-        new_conv.weight.data[:, 3:, :, :] = 0.0
-
-        if bias is not None:
-            new_conv.bias.data = bias
-
-        try:
-            self.encoder.model.patch_embed.proj = new_conv
-        except AttributeError:
-            self.encoder.patch_embed.proj = new_conv
-
-        print(f"[Optimized] Patched input layer: 3 -> {in_channels} channels")
-
     # ------------------------------------------------------------------
-    # Token routing helpers (only used when use_token_routing=True)
+    # Token routing helpers (only used when config.token_routing=True)
     # ------------------------------------------------------------------
 
     def _run_block_routed(
@@ -564,8 +468,7 @@ class OptimizedGreenFormer(nn.Module):
 
         # For global attention stages, B_eff == B and N == N_spatial
         assert B_eff == B and N == N_spatial, (
-            f"Token routing expects global attention stage: B_eff={B_eff}, B={B}, "
-            f"N={N}, N_spatial={N_spatial}"
+            f"Token routing expects global attention stage: B_eff={B_eff}, B={B}, N={N}, N_spatial={N_spatial}"
         )
 
         # Dimension-expanding blocks (stage transitions) cannot be routed
@@ -600,9 +503,7 @@ class OptimizedGreenFormer(nn.Module):
 
         return results
 
-    def _forward_encoder_with_routing(
-        self, x: torch.Tensor, alpha_hint: torch.Tensor
-    ) -> list[torch.Tensor]:
+    def _forward_encoder_with_routing(self, x: torch.Tensor, alpha_hint: torch.Tensor) -> list[torch.Tensor]:
         """Custom forward through Hiera encoder with token routing at stages 2-3."""
         hiera = self.encoder.model
 
@@ -611,12 +512,11 @@ class OptimizedGreenFormer(nn.Module):
         x_tok = hiera.unroll(x_tok)
 
         # Precompute edge masks
-        edge_mask_s2 = self.router.compute_edge_mask(
-            alpha_hint, self._stage2_shape[0], self._stage2_shape[1]
-        )
-        edge_mask_s3 = self.router.compute_edge_mask(
-            alpha_hint, self._stage3_shape[0], self._stage3_shape[1]
-        )
+        _stage2_shape = self._stage_token_shapes[2]
+        _stage3_shape = self._stage_token_shapes[3]
+
+        edge_mask_s2 = self.router.compute_edge_mask(alpha_hint, _stage2_shape[0], _stage2_shape[1])
+        edge_mask_s3 = self.router.compute_edge_mask(alpha_hint, _stage3_shape[0], _stage3_shape[1])
 
         intermediates = []
         stage2_start = self._stage_ends[1] + 1  # block 5
@@ -631,8 +531,11 @@ class OptimizedGreenFormer(nn.Module):
                     x_tok = blk(x_tok)
                 else:
                     x_tok = self._run_block_routed(
-                        blk, x_tok, edge_mask_s3,
-                        self.ltrm_stage3[ltrm3_idx], self._stage3_shape,
+                        blk,
+                        x_tok,
+                        edge_mask_s3,
+                        self.ltrm_stage3[ltrm3_idx],
+                        _stage3_shape,
                     )
                 ltrm3_idx += 1
             elif i >= stage2_start:
@@ -640,8 +543,11 @@ class OptimizedGreenFormer(nn.Module):
                     x_tok = blk(x_tok)
                 else:
                     x_tok = self._run_block_routed(
-                        blk, x_tok, edge_mask_s2,
-                        self.ltrm_stage2[ltrm2_idx], self._stage2_shape,
+                        blk,
+                        x_tok,
+                        edge_mask_s2,
+                        self.ltrm_stage2[ltrm2_idx],
+                        _stage2_shape,
                     )
                 ltrm2_idx += 1
             else:
@@ -658,59 +564,23 @@ class OptimizedGreenFormer(nn.Module):
     # ------------------------------------------------------------------
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
-        """Forward pass with tiled refiner and optional token routing.
+        """Forward pass with optional token routing.
 
-        Args:
-            x: [B, 4, H, W] input tensor (RGB + alpha hint).
-
-        Returns:
-            dict with 'alpha' and 'fg' tensors.
+        When ``config.token_routing`` is ``False``, delegates entirely to
+        the parent :class:`GreenFormer` forward (which already handles
+        FlashAttention, tiled refiner, and cache clearing via the config).
         """
+        if not self.config.token_routing:
+            return super().forward(x)
+
+        # --- Token routing path ---
         input_size = x.shape[2:]
+        alpha_hint = x[:, 3:4, :, :]
 
-        # --- Encode ---
-        if self.use_token_routing:
-            alpha_hint = x[:, 3:4, :, :]
-            features = self._forward_encoder_with_routing(x, alpha_hint)
-        else:
-            # Standard path: use the original Hiera encoder unchanged
-            # SDPA/FlashAttention already eliminates the N x N matrix from VRAM
-            features = self.encoder(x)
+        features = self._forward_encoder_with_routing(x, alpha_hint)
 
-        # Clear CUDA cache between encoder and decoder
-        if x.is_cuda:
+        # Cache clearing between encoder and decoder
+        if self.config.cache_clearing and x.is_cuda:
             torch.cuda.empty_cache()
 
-        # --- Decode (identical to original GreenFormer) ---
-        alpha_logits = self.alpha_decoder(features)
-        fg_logits = self.fg_decoder(features)
-
-        alpha_logits_up = F.interpolate(alpha_logits, size=input_size, mode="bilinear", align_corners=False)
-        fg_logits_up = F.interpolate(fg_logits, size=input_size, mode="bilinear", align_corners=False)
-
-        alpha_coarse = torch.sigmoid(alpha_logits_up)
-        fg_coarse = torch.sigmoid(fg_logits_up)
-
-        # Clear cache before refiner
-        if x.is_cuda:
-            torch.cuda.empty_cache()
-
-        # --- Refiner (tiled) ---
-        rgb = x[:, :3, :, :]
-        coarse_pred = torch.cat([alpha_coarse, fg_coarse], dim=1)
-
-        if self.use_refiner and self.refiner is not None:
-            delta_logits = self.refiner(rgb, coarse_pred)
-        else:
-            delta_logits = torch.zeros_like(coarse_pred)
-
-        delta_alpha = delta_logits[:, 0:1]
-        delta_fg = delta_logits[:, 1:4]
-
-        alpha_final_logits = alpha_logits_up + delta_alpha
-        fg_final_logits = fg_logits_up + delta_fg
-
-        alpha_final = torch.sigmoid(alpha_final_logits)
-        fg_final = torch.sigmoid(fg_final_logits)
-
-        return {"alpha": alpha_final, "fg": fg_final}
+        return self._decode_and_refine(features, x, input_size)

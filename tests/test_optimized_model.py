@@ -24,7 +24,6 @@ from CorridorKeyModule.core.optimized_model import (
     TiledCNNRefiner,
 )
 
-
 # ---------------------------------------------------------------------------
 # ECA
 # ---------------------------------------------------------------------------
@@ -129,8 +128,8 @@ class TestHintBasedTokenRouter:
         """Hint with distinct BG/FG/edge regions should route correctly."""
         router = HintBasedTokenRouter(threshold_low=0.02, threshold_high=0.98, min_edge_tokens=0)
         hint = torch.zeros(1, 1, 64, 64)
-        hint[0, 0, :32, :] = 0.0   # top half: BG
-        hint[0, 0, 32:, :] = 1.0   # bottom half: FG
+        hint[0, 0, :32, :] = 0.0  # top half: BG
+        hint[0, 0, 32:, :] = 1.0  # bottom half: FG
         # The boundary row will have some intermediate values after area downsample
         mask = router.compute_edge_mask(hint, 8, 8)
         # Most tokens should NOT be edge
@@ -195,6 +194,7 @@ class TestTiledCNNRefiner:
         torch.manual_seed(42)
         refiner_tiled = TiledCNNRefiner(tile_size=48, tile_overlap=24)
         from CorridorKeyModule.core.model_transformer import CNNRefinerModule
+
         refiner_full = CNNRefinerModule()
         refiner_full.load_state_dict(refiner_tiled.state_dict())
 
@@ -230,6 +230,7 @@ class TestOptimizedGreenFormerStructure:
     def test_import(self):
         """OptimizedGreenFormer should be importable."""
         from CorridorKeyModule.core.optimized_model import OptimizedGreenFormer
+
         assert OptimizedGreenFormer is not None
 
     def test_token_routing_disabled_by_default(self):
@@ -237,7 +238,7 @@ class TestOptimizedGreenFormerStructure:
         from CorridorKeyModule.core.optimized_model import OptimizedGreenFormer
 
         model = OptimizedGreenFormer(img_size=224, use_refiner=False)
-        assert model.use_token_routing is False
+        assert model.config.token_routing is False
         assert model.ltrm_stage2 is None
         assert model.ltrm_stage3 is None
         assert model.router is None
@@ -247,7 +248,7 @@ class TestOptimizedGreenFormerStructure:
         from CorridorKeyModule.core.optimized_model import OptimizedGreenFormer
 
         model = OptimizedGreenFormer(img_size=224, use_refiner=False, use_token_routing=True)
-        assert model.use_token_routing is True
+        assert model.config.token_routing is True
         assert model.ltrm_stage2 is not None
         assert model.ltrm_stage3 is not None
         assert model.router is not None
@@ -281,6 +282,7 @@ class TestOptimizedEngineAPI:
 
     def _make_optimized_engine_mock(self, img_size=64):
         """Create an OptimizedCorridorKeyEngine with a mocked model."""
+        from CorridorKeyModule.optimization_config import OptimizationConfig
         from CorridorKeyModule.optimized_engine import OptimizedCorridorKeyEngine
 
         def fake_forward(x):
@@ -300,6 +302,7 @@ class TestOptimizedEngineAPI:
         engine.img_size = img_size
         engine.checkpoint_path = "/fake/checkpoint.pth"
         engine.use_refiner = False
+        engine.config = OptimizationConfig.optimized()
         engine.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
         engine.std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 1, 3)
         engine.model = mock_model
@@ -351,9 +354,11 @@ class TestOptimizedEngineAPI:
 class TestBackendFactory:
     def test_torch_optimized_is_valid_backend(self):
         from CorridorKeyModule.backend import VALID_BACKENDS
+
         assert "torch_optimized" in VALID_BACKENDS
 
     def test_resolve_backend_explicit(self):
         from CorridorKeyModule.backend import resolve_backend
+
         assert resolve_backend("torch") == "torch"
         assert resolve_backend("torch_optimized") == "torch_optimized"

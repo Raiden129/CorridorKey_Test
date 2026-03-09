@@ -221,8 +221,18 @@ def create_engine(
     backend: str | None = None,
     device: str | None = None,
     img_size: int = DEFAULT_IMG_SIZE,
+    optimization_config=None,
 ):
-    """Factory: returns an engine with process_frame() matching the Torch contract."""
+    """Factory: returns an engine with process_frame() matching the Torch contract.
+
+    Args:
+        backend: Backend name (auto/torch/torch_optimized/mlx).
+        device: Torch device string (e.g. "cuda", "cpu").
+        img_size: Model input resolution.
+        optimization_config: Optional :class:`OptimizationConfig` to pass
+            through to the engine.  When ``None``, each backend uses its
+            own default profile.
+    """
     backend = resolve_backend(backend)
 
     if backend == "mlx":
@@ -238,11 +248,19 @@ def create_engine(
 
         logger.info("Optimized Torch engine loaded: %s (device=%s)", ckpt.name, device)
         return OptimizedCorridorKeyEngine(
-            checkpoint_path=str(ckpt), device=device or "cpu", img_size=img_size
+            checkpoint_path=str(ckpt),
+            device=device or "cpu",
+            img_size=img_size,
+            optimization_config=optimization_config,
         )
     else:
         ckpt = _discover_checkpoint(TORCH_EXT)
         from CorridorKeyModule.inference_engine import CorridorKeyEngine
 
         logger.info("Torch engine loaded: %s (device=%s)", ckpt.name, device)
-        return CorridorKeyEngine(checkpoint_path=str(ckpt), device=device or "cpu", img_size=img_size)
+        return CorridorKeyEngine(
+            checkpoint_path=str(ckpt),
+            device=device or "cpu",
+            img_size=img_size,
+            optimization_config=optimization_config,
+        )
