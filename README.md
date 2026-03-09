@@ -59,36 +59,37 @@ The original engine (no optimizations at all) OOMs immediately at 4K on 8 GB GPU
 All footage is from Tears of Steel scene 02_3c, 4096x2160 at 24 fps.
 
 #### Raw Green Screen Input
-
-https://github.com/Raiden129/CorridorKey_Test/raw/refs/heads/main/docs/videos/raw_greenscreen.mp4
-
 https://github.com/user-attachments/assets/f4f76365-927b-4813-8944-8511d9243a42
-
-
-
 #### Alpha Hint (Input Mask)
 
-https://github.com/Raiden129/CorridorKey_Test/raw/refs/heads/main/docs/videos/alpha_hint.mp4
+https://github.com/user-attachments/assets/625b4784-b5f9-4372-ab65-782335982ce6
 
 #### Composite Output (Baseline vs Optimized)
 
 Baseline (Flash Attention only):
 
-https://github.com/Raiden129/CorridorKey_Test/raw/refs/heads/main/docs/videos/comp_baseline.mp4
+
+https://github.com/user-attachments/assets/161e60ae-e6a4-4abe-b8c1-a527951ee076
+
+
 
 Optimized (all optimizations):
 
-https://github.com/Raiden129/CorridorKey_Test/raw/refs/heads/main/docs/videos/comp_optimized.mp4
+
+https://github.com/user-attachments/assets/15ea4d9c-40c5-4db6-b197-ff1407cdf65b
+
 
 #### Alpha Matte (Baseline vs Optimized)
 
 Baseline:
 
-https://github.com/Raiden129/CorridorKey_Test/raw/refs/heads/main/docs/videos/alpha_baseline.mp4
+https://github.com/user-attachments/assets/3fb6b15e-eed2-4747-836c-046580509a31
 
 Optimized:
 
-https://github.com/Raiden129/CorridorKey_Test/raw/refs/heads/main/docs/videos/alpha_optimized.mp4
+
+https://github.com/user-attachments/assets/d6d46576-43a3-4bd1-a332-b530d54fe456
+
 
 ---
 
