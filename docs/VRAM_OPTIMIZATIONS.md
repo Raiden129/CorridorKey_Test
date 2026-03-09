@@ -9,6 +9,7 @@ The original CorridorKey engine OOMs at its native 2048x2048 inference resolutio
 ## Table of Contents
 
 - [Benchmark Results](#benchmark-results)
+  - [Visual Comparison](#visual-comparison)
 - [Optimizations Implemented](#optimizations-implemented)
   - [1. Flash Attention Patching](#1-flash-attention-patching)
   - [2. Tiled CNN Refiner](#2-tiled-cnn-refiner)
@@ -52,6 +53,34 @@ Test setup: 100 frames, 4096x2160 OpenEXR 16-bit half-float, linear color space,
 ### Why "Flash Attention Only" as baseline?
 
 The original engine (no optimizations at all) OOMs immediately at 4K on 8 GB GPUs. Flash Attention is the minimum required optimization to avoid the out-of-memory crash. The baseline uses Flash Attention only to serve as the closest proxy to original behavior while remaining runnable.
+
+### Visual Comparison
+
+All footage is from Tears of Steel scene 02_3c, 4096x2160 at 24 fps.
+
+#### Raw Green Screen Input
+
+<video src="videos/raw_greenscreen.mp4" controls width="100%"></video>
+
+#### Composite Output (Baseline vs Optimized)
+
+Baseline (Flash Attention only):
+
+<video src="videos/comp_baseline.mp4" controls width="100%"></video>
+
+Optimized (all optimizations):
+
+<video src="videos/comp_optimized.mp4" controls width="100%"></video>
+
+#### Alpha Matte (Baseline vs Optimized)
+
+Baseline:
+
+<video src="videos/alpha_baseline.mp4" controls width="100%"></video>
+
+Optimized:
+
+<video src="videos/alpha_optimized.mp4" controls width="100%"></video>
 
 ---
 
