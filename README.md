@@ -62,6 +62,10 @@ All footage is from Tears of Steel scene 02_3c, 4096x2160 at 24 fps.
 
 <video src="docs/videos/raw_greenscreen.mp4" controls width="100%"></video>
 
+#### Alpha Hint (Input Mask)
+
+<video src="docs/videos/alpha_hint.mp4" controls width="100%"></video>
+
 #### Composite Output (Baseline vs Optimized)
 
 Baseline (Flash Attention only):
