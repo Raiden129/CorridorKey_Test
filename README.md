@@ -60,31 +60,31 @@ All footage is from Tears of Steel scene 02_3c, 4096x2160 at 24 fps.
 
 #### Raw Green Screen Input
 
-<video src="docs/videos/raw_greenscreen.mp4" controls width="100%"></video>
+https://github.com/Raiden129/CorridorKey_Test/raw/refs/heads/main/docs/videos/raw_greenscreen.mp4
 
 #### Alpha Hint (Input Mask)
 
-<video src="docs/videos/alpha_hint.mp4" controls width="100%"></video>
+https://github.com/Raiden129/CorridorKey_Test/raw/refs/heads/main/docs/videos/alpha_hint.mp4
 
 #### Composite Output (Baseline vs Optimized)
 
 Baseline (Flash Attention only):
 
-<video src="docs/videos/comp_baseline.mp4" controls width="100%"></video>
+https://github.com/Raiden129/CorridorKey_Test/raw/refs/heads/main/docs/videos/comp_baseline.mp4
 
 Optimized (all optimizations):
 
-<video src="docs/videos/comp_optimized.mp4" controls width="100%"></video>
+https://github.com/Raiden129/CorridorKey_Test/raw/refs/heads/main/docs/videos/comp_optimized.mp4
 
 #### Alpha Matte (Baseline vs Optimized)
 
 Baseline:
 
-<video src="docs/videos/alpha_baseline.mp4" controls width="100%"></video>
+https://github.com/Raiden129/CorridorKey_Test/raw/refs/heads/main/docs/videos/alpha_baseline.mp4
 
 Optimized:
 
-<video src="docs/videos/alpha_optimized.mp4" controls width="100%"></video>
+https://github.com/Raiden129/CorridorKey_Test/raw/refs/heads/main/docs/videos/alpha_optimized.mp4
 
 ---
 
