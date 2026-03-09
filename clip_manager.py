@@ -238,7 +238,7 @@ def get_birefnet_model(device: str = "cpu"):
 
     use_half = cache_key.startswith("cuda")
     if use_half:
-        torch.set_float32_matmul_precision("high")
+        torch.set_float32_matmul_precision("highest")
         model.half()
 
     transform_image = transforms.Compose(
@@ -1145,3 +1145,4 @@ if __name__ == "__main__":
             print("Error: --win_path required for wizard.")
         else:
             raise NotImplementedError("interactive_wizard is not yet implemented")
+
