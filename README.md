@@ -29,9 +29,9 @@ Naturally, I have not tested everything. If you encounter errors, please conside
 
 ## Hardware Requirements
 
-This project was designed and built on a Linux workstation (Puget Systems PC) equipped with an NVIDIA RTX Pro 6000 with 96GB of VRAM. This project is not yet optimized for sub 24 gig VRAM systems, but with the help of the community, maybe we can make that happen.
+This project was designed and built on a Linux workstation (Puget Systems PC) equipped with an NVIDIA RTX Pro 6000 with 96GB of VRAM.
 
-*   **CorridorKey:** Running inference natively at 2048x2048 requires approximately **22.7 GB of VRAM**. You will need at least a 24GB GPU (such as a 3090, 4090, 5090, etc). It is highly recommended to run this on a secondary GPU that is not driving your OS/displays, or on a rented cloud instance (like Runpod or Google Colab) to avoid Out-Of-Memory errors.
+*   **CorridorKey:** Running inference natively at 2048x2048 requires a CUDA-capable GPU. On GPUs with less than 16 GB of VRAM (such as the RTX 4060, 4070, etc.), the engine automatically enables VRAM optimizations that allow full 4K DCI (4096x2160) processing on as little as 8 GB of VRAM. On GPUs with 24 GB or more (3090, 4090, 5090), the original unoptimized engine is used. See the [VRAM Optimizations](#vram-optimizations) section below for details and benchmark results.
     *   **Windows Users:** To run GPU acceleration natively on Windows, your system MUST have NVIDIA drivers that support **CUDA 12.6 or higher** installed. If your drivers only support older CUDA versions, the installer will likely fallback to the CPU.
 *   **GVM (Optional):** Requires approximately **80 GB of VRAM** and utilizes massive Stable Video Diffusion models.
 *   **VideoMaMa (Optional):** Natively requires a massive chunk of VRAM as well (originally 80GB+). While the community has tweaked the architecture to run at less than 24GB, those extreme memory optimizations have not yet been fully implemented in this repository.
@@ -114,6 +114,192 @@ For the easiest experience, use the provided launcher scripts. These scripts lau
     *   `/FG`: The raw Straight Foreground Color Object. (Note: The engine natively computes this in the sRGB gamut. You must manually convert this pass to linear gamma before being combined with the alpha in your compositing program).
     *   `/Processed`: An RGBA image containing the Linear Foreground premultiplied against the Linear Alpha (EXR). This pass exists so you can immediately drop the footage into Premiere/Resolve for a quick preview without dealing with complex premultiplication routing. However, if you want more control over your image, working with the raw FG and Matte outputs will give you that.
     *   `/Comp`: A simple preview of the key composited over a checkerboard (PNG).
+
+## VRAM Optimizations
+
+The original CorridorKey engine OOMs at its native 2048x2048 inference resolution on 8 GB GPUs. Even with Flash Attention enabled (the minimum to avoid the OOM), PyTorch's allocator reserves 9.8 GB and spills into system RAM. This optimization suite reduces that reserved memory to 1.6 GB (84% reduction) while also being 40% faster per frame, enabling full 4K DCI processing on an 8 GB laptop GPU.
+
+### Benchmark Results
+
+Tested on real 4K green screen footage from [Tears of Steel](https://mango.blender.org/) (CC-BY 3.0, Blender Foundation).
+
+Test setup: 100 frames, 4096x2160 OpenEXR 16-bit half-float, linear color space, NVIDIA RTX 4060 Laptop GPU (8 GB).
+
+#### Speed
+
+| Metric | Flash Attention Only (Baseline) | All Optimizations | Improvement |
+|---|---:|---:|---:|
+| Total time (100 frames) | 1118.8 s | 785.9 s | -29.8% |
+| Effective FPS | 0.09 fps | 0.13 fps | +44.4% |
+| Avg frame time | 8423 ms | 5038 ms | -40.2% |
+| Median frame time | 8402 ms | 4979 ms | -40.7% |
+
+#### VRAM
+
+| Metric | Baseline | Optimized | Improvement |
+|---|---:|---:|---:|
+| Dedicated VRAM (physical) | 8188 MB (maxed out) | 5166 MB | -37% |
+| PyTorch allocator reserved | 9792 MB | 1582 MB | -84% |
+| Shared GPU memory spillover | ~1604 MB | 0 MB | Eliminated |
+| Headroom within 8 GB VRAM | 0 MB | 6606 MB | -- |
+
+> The baseline completely saturates the 8 GB GPU and spills ~1.6 GB into shared GPU memory (system RAM accessed over PCIe), which is significantly slower than dedicated VRAM. The optimized config fits comfortably within dedicated VRAM with over 6 GB of headroom.
+
+#### Why "Flash Attention Only" as baseline?
+
+The original engine (no optimizations at all) OOMs immediately at 4K on 8 GB GPUs. Flash Attention is the minimum required optimization to avoid the out-of-memory crash. The baseline uses Flash Attention only to serve as the closest proxy to original behavior while remaining runnable.
+
+### Visual Comparison
+
+All footage is from Tears of Steel scene 02_3c, 4096x2160 at 24 fps.
+
+#### Raw Green Screen Input
+
+<video src="docs/videos/raw_greenscreen.mp4" controls width="100%"></video>
+
+#### Composite Output (Baseline vs Optimized)
+
+Baseline (Flash Attention only):
+
+<video src="docs/videos/comp_baseline.mp4" controls width="100%"></video>
+
+Optimized (all optimizations):
+
+<video src="docs/videos/comp_optimized.mp4" controls width="100%"></video>
+
+#### Alpha Matte (Baseline vs Optimized)
+
+Baseline:
+
+<video src="docs/videos/alpha_baseline.mp4" controls width="100%"></video>
+
+Optimized:
+
+<video src="docs/videos/alpha_optimized.mp4" controls width="100%"></video>
+
+### Optimizations Implemented
+
+#### 1. Flash Attention Patching
+
+Config flag: `flash_attention: True`
+Impact: Required to avoid OOM at 4K on 8 GB GPUs. Without this patch, the global attention blocks materialize a full N x N attention matrix, which does not fit in memory.
+
+CorridorKey uses Meta's [Hiera](https://github.com/facebookresearch/hiera) vision transformer as its backbone. Hiera organizes tokens into "mask units" for windowed attention (Stages 0-1), then switches to global attention (Stages 2-3) by setting `num_windows = 1`.
+
+The problem is in how Hiera constructs its Q/K/V tensors. For global attention, it creates tensors with shape `[B, heads, 1, N, head_dim]`, a 5D tensor where the `num_windows` dimension is 1. When this 5D non-contiguous tensor is passed to `F.scaled_dot_product_attention`, PyTorch's SDPA dispatcher silently falls back to the math backend, which materializes the full `N x N` attention matrix in memory instead of using the memory-efficient FlashAttention kernel.
+
+The fix monkey-patches the `forward()` method of Hiera's `MaskUnitAttention` on global-attention blocks to squeeze the `num_windows` dimension, making Q/K/V contiguous 4D tensors that correctly dispatch to FlashAttention/memory-efficient kernels.
+
+#### 2. Tiled CNN Refiner
+
+Config flag: `tiled_refiner: True`, `tile_size: 512`, `tile_overlap: 128`
+Impact: Reduces VRAM usage during the refiner stage by processing the input in small tiles instead of the full 2048x2048 resolution at once.
+
+The CNN Refiner takes a 7-channel input at full 2048x2048 resolution and runs dilated residual convolution blocks. The `TiledCNNRefiner` processes this in overlapping 512x512 tiles with 128px overlap, merged using linear blend weights. This is mathematically lossless because the refiner's receptive field (~65px) is fully covered by the 128px overlap.
+
+#### 3. cuDNN Benchmark Disable
+
+Config flag: `disable_cudnn_benchmark: True`
+Impact: Reduces VRAM used by cuDNN workspace allocations during convolution benchmarking.
+
+Sets `torch.backends.cudnn.benchmark = False` so cuDNN uses its default heuristic-selected algorithm instead of allocating workspace memory to benchmark multiple algorithms.
+
+#### 4. CUDA Cache Clearing
+
+Config flag: `cache_clearing: True`
+Impact: Prevents memory accumulation between pipeline stages.
+
+Calls `torch.cuda.empty_cache()` between the encoder, decoder, and refiner stages so each stage only needs to hold its own tensors rather than the accumulated cache from all previous stages.
+
+#### 5. Token Routing (Experimental)
+
+Config flag: `token_routing: True`
+Status: Experimental, disabled by default. Requires fine-tuning for production use.
+
+Routes "easy" tokens (solid foreground/background) to a lightweight LTRM (Lightweight Token Refinement Module) instead of full global self-attention. Only "edge" tokens go through the expensive O(N^2) global attention. The LTRM weights are zero-initialized so the module starts as an identity function, making it compatible with the pretrained checkpoint without fine-tuning.
+
+### Engine Architecture
+
+```
+_BaseCorridorKeyEngine (base_engine.py)
+    Abstract base class: constructor, checkpoint loading,
+    process_frame() pipeline, cuDNN disable, metrics
+    |
+    |--- CorridorKeyEngine (inference_engine.py)
+    |       Original engine. Uses GreenFormer directly.
+    |       Defaults to OptimizationConfig.original() (all opts off)
+    |
+    |--- OptimizedCorridorKeyEngine (optimized_engine.py)
+            Optimized engine. Uses OptimizedGreenFormer.
+            Defaults to OptimizationConfig.optimized() (4 production opts on)
+```
+
+Optimizations are config-driven, not engine-driven. Both engines accept any `OptimizationConfig`. The auto-backend selector in `CorridorKeyModule/backend.py` picks the optimized engine for CUDA GPUs with less than 16 GB VRAM, the standard engine for 16 GB+, and MLX for Apple Silicon.
+
+### Inference Pipeline
+
+```
+Input (4096x2160 EXR, linear float)
+  |
+  v
+[Lanczos4 resize to 2048x2048]
+  |
+  v
+[Linear -> sRGB conversion] (if input_is_linear=True)
+  |
+  v
+[ImageNet normalization + alpha hint concat -> 4-channel input]
+  |
+  v
+[Hiera Encoder]    Stages 0-1: Windowed attention (efficient)
+  |                Stages 2-3: Global attention (FlashAttention patched)
+  |
+  |-- torch.cuda.empty_cache() (if cache_clearing)
+  |
+  v
+[Multiscale Decoder]    Predicts coarse alpha (1ch) + coarse FG (3ch)
+  |
+  |-- torch.cuda.empty_cache() (if cache_clearing)
+  |
+  v
+[CNN Refiner / TiledCNNRefiner]    7ch input (RGB + coarse predictions)
+  |                                Produces additive delta logits
+  |                                (512x512 tiles if tiled_refiner)
+  v
+[Sigmoid activation]
+  |
+  v
+[Lanczos4 resize back to 4096x2160]
+  |
+  v
+[Post-processing: despill, premultiply, composite]
+  |
+  v
+Output: alpha, FG (sRGB), processed (linear premul RGBA), comp (sRGB preview)
+```
+
+### OptimizationConfig Profiles
+
+| Profile | `flash_attention` | `tiled_refiner` | `disable_cudnn_benchmark` | `cache_clearing` | `token_routing` |
+|---|:---:|:---:|:---:|:---:|:---:|
+| `original` | off | off | off | off | off |
+| `optimized` (production) | on | on | on | on | off |
+| `experimental` | on | on | on | on | on |
+
+### Running the Benchmark
+
+```bash
+# 1. Download test footage (~5.1 GB)
+uv run python tears_of_steel_test/download_frames.py
+
+# 2. Generate alpha hints
+uv run python tears_of_steel_test/generate_alpha_hints.py
+
+# 3. Run benchmark
+uv run python benchmark_4k_vram.py
+```
+
+For the full technical documentation including benchmark methodology, GPU memory measurement details, and Python API examples, see [docs/VRAM_OPTIMIZATIONS.md](docs/VRAM_OPTIMIZATIONS.md).
 
 ## But What About Training and Datasets?
 
