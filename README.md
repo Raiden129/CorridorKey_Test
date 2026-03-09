@@ -62,6 +62,10 @@ All footage is from Tears of Steel scene 02_3c, 4096x2160 at 24 fps.
 
 https://github.com/Raiden129/CorridorKey_Test/raw/refs/heads/main/docs/videos/raw_greenscreen.mp4
 
+https://github.com/user-attachments/assets/f4f76365-927b-4813-8944-8511d9243a42
+
+
+
 #### Alpha Hint (Input Mask)
 
 https://github.com/Raiden129/CorridorKey_Test/raw/refs/heads/main/docs/videos/alpha_hint.mp4
