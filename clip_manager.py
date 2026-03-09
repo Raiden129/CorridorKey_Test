@@ -6,7 +6,7 @@ import logging
 import os
 import shutil
 import sys
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterator
 
 # Enable OpenEXR support in OpenCV — needed for EXR I/O throughout the pipeline.
 # Must be set before any cv2.imread/imwrite calls on .exr files.
@@ -27,6 +27,10 @@ logger = logging.getLogger(__name__)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CLIPS_DIR = os.path.join(BASE_DIR, "ClipsForInference")
 OUTPUT_DIR = os.path.join(BASE_DIR, "Output")
+ALPHA_HINT_BACKENDS = ("gvm", "birefnet", "videomama")
+BIREFNET_MODEL_ID = "zhengpeng7/BiRefNet_HR-matting"
+BIREFNET_LOCAL_MODEL_DIR = os.path.join(BASE_DIR, "BiRefNet", "checkpoints", "BiRefNet_HR-matting")
+_BIREFNET_MODEL_CACHE: dict[str, tuple] = {}
 
 # Network Mapping
 # Windows Drive -> Linux Mount Point
@@ -185,7 +189,127 @@ def get_gvm_processor(device: str = "cpu") -> GVMProcessor:
         raise RuntimeError(f"Failed to initialize GVM Processor: {e}") from e
 
 
-def generate_alphas(clips, device=None):
+def _normalize_alpha_backend(backend: str | None) -> str:
+    normalized = (backend or "gvm").lower()
+    if normalized not in ALPHA_HINT_BACKENDS:
+        raise ValueError(f"Unknown alpha backend '{backend}'. Expected one of: {', '.join(ALPHA_HINT_BACKENDS)}")
+    return normalized
+
+
+def _prepare_alpha_output_dir(alpha_output_dir: str) -> None:
+    if os.path.isdir(alpha_output_dir):
+        shutil.rmtree(alpha_output_dir)
+    elif os.path.exists(alpha_output_dir):
+        os.remove(alpha_output_dir)
+    os.makedirs(alpha_output_dir, exist_ok=True)
+
+
+def _resolve_birefnet_model_source() -> str:
+    if os.path.isdir(BIREFNET_LOCAL_MODEL_DIR):
+        return BIREFNET_LOCAL_MODEL_DIR
+
+    logger.warning(
+        "BiRefNet weights not found at %s. Falling back to on-demand HuggingFace download for %s.",
+        BIREFNET_LOCAL_MODEL_DIR,
+        BIREFNET_MODEL_ID,
+    )
+    return BIREFNET_MODEL_ID
+
+
+def get_birefnet_model(device: str = "cpu"):
+    cache_key = device or "cpu"
+    cached = _BIREFNET_MODEL_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        import torch
+        from torchvision import transforms
+        from transformers import AutoModelForImageSegmentation
+    except ImportError as e:
+        raise ImportError(
+            "Could not import BiRefNet dependencies. Run Install_BiRefNet_Windows.bat or uv sync first."
+        ) from e
+
+    model_source = _resolve_birefnet_model_source()
+    model = AutoModelForImageSegmentation.from_pretrained(model_source, trust_remote_code=True)
+    model.to(cache_key)
+    model.eval()
+
+    use_half = cache_key.startswith("cuda")
+    if use_half:
+        torch.set_float32_matmul_precision("high")
+        model.half()
+
+    transform_image = transforms.Compose(
+        [
+            transforms.Resize((2048, 2048)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ]
+    )
+
+    bundle = (model, transform_image, use_half)
+    _BIREFNET_MODEL_CACHE[cache_key] = bundle
+    return bundle
+
+
+def _read_image_as_rgb_uint8(image_path: str) -> np.ndarray | None:
+    img = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        return None
+
+    if np.issubdtype(img.dtype, np.floating):
+        img = np.nan_to_num(img, nan=0.0, posinf=1.0, neginf=0.0)
+        img = np.clip(img, 0.0, 1.0)
+        if image_path.lower().endswith(".exr"):
+            img = img ** (1.0 / 2.2)
+        img = (img * 255.0).astype(np.uint8)
+    elif img.dtype != np.uint8:
+        img = np.clip(img, 0, 255).astype(np.uint8)
+
+    if img.ndim == 2:
+        return cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+    if img.shape[2] == 4:
+        return cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+
+def _iter_clip_frames_for_birefnet(clip: ClipEntry) -> Iterator[tuple[str, np.ndarray]]:
+    if clip.input_asset is None:
+        return
+
+    if clip.input_asset.type == "sequence":
+        files = sorted([f for f in os.listdir(clip.input_asset.path) if is_image_file(f)])
+        for index, file_name in enumerate(files):
+            frame_rgb = _read_image_as_rgb_uint8(os.path.join(clip.input_asset.path, file_name))
+            if frame_rgb is None:
+                logger.warning("BiRefNet: could not read input frame %s for %s", file_name, clip.name)
+                continue
+
+            stem = os.path.splitext(file_name)[0]
+            yield f"{stem}_alphaHint_{index:04d}.png", frame_rgb
+        return
+
+    base_name = os.path.splitext(os.path.basename(clip.input_asset.path))[0]
+    cap = cv2.VideoCapture(clip.input_asset.path)
+    if not cap.isOpened():
+        logger.error("BiRefNet: failed to open input video for %s: %s", clip.name, clip.input_asset.path)
+        return
+
+    frame_index = 0
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            yield f"{base_name}_alphaHint_{frame_index:04d}.png", cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame_index += 1
+    finally:
+        cap.release()
+
+
+def _generate_alphas_gvm(clips, device=None):
     clips_to_process = [c for c in clips if c.alpha_asset is None]
 
     if not clips_to_process:
@@ -211,9 +335,7 @@ def generate_alphas(clips, device=None):
         logger.info(f"Generating Alpha for: {clip.name}")
 
         alpha_output_dir = os.path.join(clip.root_path, "AlphaHint")
-        if os.path.exists(alpha_output_dir):
-            shutil.rmtree(alpha_output_dir)
-        os.makedirs(alpha_output_dir, exist_ok=True)
+        _prepare_alpha_output_dir(alpha_output_dir)
 
         try:
             processor.process_sequence(
@@ -261,6 +383,98 @@ def generate_alphas(clips, device=None):
             import traceback
 
             traceback.print_exc()
+
+
+def _generate_alphas_birefnet(clips, device=None):
+    clips_to_process = [c for c in clips if c.alpha_asset is None]
+
+    if not clips_to_process:
+        logger.info("All clips have valid Alpha assets. No generation needed.")
+        return
+
+    logger.info(f"Found {len(clips_to_process)} clips missing Alpha.")
+
+    if device is None:
+        device = resolve_device()
+
+    try:
+        import torch
+        from PIL import Image
+    except ImportError as e:
+        logger.error(f"BiRefNet Import Error: {e}")
+        logger.error("Skipping BiRefNet generation. Please install BiRefNet requirements first.")
+        return
+
+    try:
+        model, transform_image, use_half = get_birefnet_model(device=device)
+    except ImportError as e:
+        logger.error(f"BiRefNet Import Error: {e}")
+        logger.error("Skipping BiRefNet generation. Please run Install_BiRefNet_Windows.bat first.")
+        return
+    except Exception as e:
+        logger.error(f"BiRefNet Initialization Error: {e}")
+        return
+
+    for clip in clips_to_process:
+        logger.info(f"Generating Alpha with BiRefNet for: {clip.name}")
+
+        alpha_output_dir = os.path.join(clip.root_path, "AlphaHint")
+        _prepare_alpha_output_dir(alpha_output_dir)
+
+        total_saved = 0
+
+        try:
+            for output_name, frame_rgb in _iter_clip_frames_for_birefnet(clip):
+                image = Image.fromarray(frame_rgb)
+                input_image = transform_image(image).unsqueeze(0).to(device)
+                if use_half:
+                    input_image = input_image.half()
+
+                with torch.inference_mode():
+                    prediction = model(input_image)
+
+                if isinstance(prediction, (tuple, list)):
+                    pred_tensor = prediction[-1]
+                elif hasattr(prediction, "logits"):
+                    pred_tensor = prediction.logits
+                else:
+                    raise RuntimeError("BiRefNet returned an unsupported output format.")
+
+                pred = pred_tensor.sigmoid().float().cpu()[0].squeeze()
+                pred_np = np.clip(pred.numpy() * 255.0, 0.0, 255.0).astype(np.uint8)
+                pred_np = cv2.resize(pred_np, image.size, interpolation=cv2.INTER_CUBIC)
+
+                cv2.imwrite(os.path.join(alpha_output_dir, output_name), pred_np)
+                total_saved += 1
+
+            if total_saved == 0:
+                logger.error(f"BiRefNet finished but no masks were saved for {clip.name}")
+                continue
+
+            logger.info(f"Saved {total_saved} alpha frames to {alpha_output_dir}")
+            clip.alpha_asset = ClipAsset(alpha_output_dir, "sequence")
+
+        except Exception as e:
+            logger.error(f"Error generating alpha with BiRefNet for {clip.name}: {e}")
+            import traceback
+
+            traceback.print_exc()
+
+
+def generate_alphas(clips, device=None, backend: str = "gvm", chunk_size: int = 50):
+    """Generate AlphaHint assets with the requested backend.
+
+    `gvm` and `birefnet` both generate AlphaHint directly from Input.
+    `videomama` requires VideoMamaMaskHint assets and delegates to `run_videomama()`.
+    """
+    normalized_backend = _normalize_alpha_backend(backend)
+
+    if normalized_backend == "gvm":
+        return _generate_alphas_gvm(clips, device=device)
+    if normalized_backend == "birefnet":
+        return _generate_alphas_birefnet(clips, device=device)
+
+    return run_videomama(clips, chunk_size=chunk_size, device=device)
 
 
 def run_videomama(clips: list[ClipEntry], chunk_size: int = 50, device: str | None = None) -> None:
@@ -889,6 +1103,12 @@ if __name__ == "__main__":
     parser.add_argument("--action", choices=["generate_alphas", "run_inference", "list", "wizard"], required=True)
     parser.add_argument("--win_path", help=r"Windows Path (example: V:\...) for Wizard Mode", default=None)
     parser.add_argument(
+        "--alpha-backend",
+        choices=ALPHA_HINT_BACKENDS,
+        default="gvm",
+        help="Alpha hint backend for generate_alphas (default: gvm)",
+    )
+    parser.add_argument(
         "--device",
         choices=["auto", "cuda", "mps", "cpu"],
         default="auto",
@@ -916,7 +1136,7 @@ if __name__ == "__main__":
         scan_clips()
     elif args.action == "generate_alphas":
         clips = scan_clips()
-        generate_alphas(clips, device=device)
+        generate_alphas(clips, device=device, backend=args.alpha_backend)
     elif args.action == "run_inference":
         clips = scan_clips()
         run_inference(clips, device=device, backend=args.backend, max_frames=args.max_frames)

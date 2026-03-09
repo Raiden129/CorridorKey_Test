@@ -22,6 +22,7 @@ import sys
 import warnings
 
 from clip_manager import (
+    ALPHA_HINT_BACKENDS,
     LINUX_MOUNT_ROOT,
     ClipEntry,
     generate_alphas,
@@ -35,6 +36,37 @@ from clip_manager import (
 from device_utils import resolve_device
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_alpha_backend_choice(explicit_backend: str | None) -> str:
+    """Resolve the alpha backend for CLI use.
+
+    If the caller did not pass --alpha-backend and stdin is interactive,
+    prompt so GVM / BiRefNet / VideoMaMa remain first-class CLI options.
+    Non-interactive usage falls back to GVM.
+    """
+    if explicit_backend:
+        return explicit_backend
+
+    if not sys.stdin.isatty():
+        return "gvm"
+
+    print("\nALPHA HINT BACKENDS:")
+    print("  [g] GVM")
+    print("  [b] BiRefNet")
+    print("  [v] VideoMaMa")
+
+    choice = input("Select backend [g/b/v, default g]: ").strip().lower()
+    backend_map = {
+        "": "gvm",
+        "g": "gvm",
+        "gvm": "gvm",
+        "b": "birefnet",
+        "birefnet": "birefnet",
+        "v": "videomama",
+        "videomama": "videomama",
+    }
+    return backend_map.get(choice, "gvm")
 
 
 def _configure_environment() -> None:
@@ -230,9 +262,9 @@ def interactive_wizard(win_path: str, device: str | None = None) -> None:
         missing_alpha = masked + raw
 
         print("\nACTIONS:")
-        if missing_alpha:
-            print(f"  [v] Run VideoMaMa (Found {len(masked)} ready with masks)")
-            print(f"  [g] Run GVM (Auto-Matte on {len(raw)} clips without Mask Hint)")
+        print(f"  [v] Run VideoMaMa (Eligible clips with VideoMamaMaskHint: {len(masked)})")
+        print(f"  [g] Run GVM (Eligible raw clips without Mask Hint: {len(raw)})")
+        print(f"  [b] Run BiRefNet (Eligible raw clips without Mask Hint: {len(raw)})")
 
         if ready:
             print(f"  [i] Run Inference (on {len(ready)} ready clips)")
@@ -244,6 +276,10 @@ def interactive_wizard(win_path: str, device: str | None = None) -> None:
 
         if choice == "v":
             # VideoMaMa
+            if not masked:
+                print("No clips currently have VideoMamaMaskHint assets. Add masks or re-scan first.")
+                continue
+
             print("\n--- VideoMaMa ---")
             print("Scanning for VideoMamaMaskHints...")
             # We pass ALL missing alpha clips. run_videomama checks for the actual files.
@@ -253,13 +289,32 @@ def interactive_wizard(win_path: str, device: str | None = None) -> None:
 
         elif choice == "g":
             # GVM
+            if not raw:
+                print("No raw clips currently need direct alpha generation.")
+                continue
+
             print("\n--- GVM Auto-Matte ---")
             print(f"This will generate alphas for {len(raw)} clips that have NO Mask Hint.")
 
             yn = input("Proceed with GVM? [y/N]: ").strip().lower()
             if yn == "y":
-                generate_alphas(raw, device=device)
+                generate_alphas(raw, device=device, backend="gvm")
                 input("GVM batch complete. Press Enter to Re-Scan...")
+            continue
+
+        elif choice == "b":
+            # BiRefNet
+            if not raw:
+                print("No raw clips currently need direct alpha generation.")
+                continue
+
+            print("\n--- BiRefNet Frame-wise Matte ---")
+            print(f"This will generate alphas for {len(raw)} clips that have NO Mask Hint.")
+
+            yn = input("Proceed with BiRefNet? [y/N]: ").strip().lower()
+            if yn == "y":
+                generate_alphas(raw, device=device, backend="birefnet")
+                input("BiRefNet batch complete. Press Enter to Re-Scan...")
             continue
 
         elif choice == "i":
@@ -292,6 +347,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="CorridorKey Clip Manager")
     parser.add_argument("--action", choices=["generate_alphas", "run_inference", "list", "wizard"], required=True)
     parser.add_argument("--win_path", help=r"Windows Path (example: V:\...) for Wizard Mode", default=None)
+    parser.add_argument(
+        "--alpha-backend",
+        choices=ALPHA_HINT_BACKENDS,
+        default=None,
+        help="Alpha hint backend for generate_alphas. If omitted in interactive mode, the CLI prompts. "
+        "Non-interactive default: gvm.",
+    )
     parser.add_argument(
         "--device",
         choices=["auto", "cuda", "mps", "cpu"],
@@ -332,7 +394,7 @@ def main() -> None:
 
     device = resolve_device(args.device)
     backend = args.backend
-    logger.info(f"Using device: {device}, backend: {backend}")
+    logger.info(f"Using device: {device}, backend: {backend}, alpha_backend: {args.alpha_backend or 'prompt/gvm'}")
 
     # Build OptimizationConfig from profile + overrides
     optimization_config = _build_optimization_config(args)
@@ -344,7 +406,9 @@ def main() -> None:
             scan_clips()
         elif args.action == "generate_alphas":
             clips = scan_clips()
-            generate_alphas(clips, device=device)
+            alpha_backend = _resolve_alpha_backend_choice(args.alpha_backend)
+            logger.info(f"Selected alpha backend: {alpha_backend}")
+            generate_alphas(clips, device=device, backend=alpha_backend)
         elif args.action == "run_inference":
             clips = scan_clips()
             run_inference(clips, device=device, backend=backend, optimization_config=optimization_config)
