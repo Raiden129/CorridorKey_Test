@@ -99,7 +99,11 @@ https://github.com/user-attachments/assets/15ea4d9c-40c5-4db6-b197-ff1407cdf65b
 
 V2 (optimized + torch.compile):
 
-https://github.com/Raiden129/CorridorKey_Test/raw/refs/heads/main/docs/videos/comp_v2.mp4
+
+
+https://github.com/user-attachments/assets/e1c84a55-2654-4744-9d57-e5cf4f147504
+
+
 
 #### Alpha Matte (Baseline vs Optimized vs V2)
 
@@ -115,7 +119,11 @@ https://github.com/user-attachments/assets/d6d46576-43a3-4bd1-a332-b530d54fe456
 
 V2 (optimized + torch.compile):
 
-https://github.com/Raiden129/CorridorKey_Test/raw/refs/heads/main/docs/videos/alpha_v2.mp4
+
+
+https://github.com/user-attachments/assets/ae9f2bc8-6cc0-4efc-8ec3-4d0d06fc649e
+
+
 
 ---
 
