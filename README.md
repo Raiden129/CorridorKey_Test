@@ -2,7 +2,7 @@
 
 Enable CorridorKey 4K inference (4096x2160) on consumer GPUs with 8 GB VRAM.
 
-The original CorridorKey engine OOMs at its native 2048x2048 inference resolution on 8 GB GPUs. Even with Flash Attention enabled (the minimum to avoid the OOM), PyTorch's allocator reserves 9.8 GB and spills into system RAM. This optimization suite reduces that reserved memory to 1.6 GB (84% reduction) while also being 40% faster per frame, enabling full 4K DCI processing on an 8 GB laptop GPU.
+The original CorridorKey engine OOMs at its native 2048x2048 inference resolution on 8 GB GPUs. Even with Flash Attention enabled (the minimum to avoid the OOM), PyTorch's allocator reserves 9.8 GB and spills into system RAM. This optimization suite reduces that reserved memory to 3.8 GB (61% reduction) while also being 58% faster per frame, enabling full 4K DCI processing on an 8 GB laptop GPU with 4.4 GB of headroom.
 
 ---
 
@@ -13,9 +13,14 @@ The original CorridorKey engine OOMs at its native 2048x2048 inference resolutio
 - [Optimizations Implemented](#optimizations-implemented)
   - [1. Flash Attention Patching](#1-flash-attention-patching)
   - [2. Tiled CNN Refiner](#2-tiled-cnn-refiner)
-  - [3. cuDNN Benchmark Disable](#3-cudnn-benchmark-disable)
-  - [4. CUDA Cache Clearing](#4-cuda-cache-clearing)
-  - [5. Token Routing (Experimental)](#5-token-routing-experimental)
+  - [3. Sparse Tiled Refiner](#3-sparse-tiled-refiner)
+  - [4. In-Place Decode-and-Refine Pipeline](#4-in-place-decode-and-refine-pipeline)
+  - [5. channels_last Memory Format](#5-channels_last-memory-format)
+  - [6. torch.inference_mode()](#6-torchinference_mode)
+  - [7. torch.compile Sub-Module Compilation](#7-torchcompile-sub-module-compilation)
+  - [8. cuDNN Benchmark Disable](#8-cudnn-benchmark-disable)
+  - [9. CUDA Cache Clearing](#9-cuda-cache-clearing)
+  - [10. Token Routing (Experimental)](#10-token-routing-experimental)
 - [Architecture](#architecture)
 - [Configuration](#configuration)
 - [Benchmark Methodology](#benchmark-methodology)
@@ -32,23 +37,36 @@ Test setup: 100 frames, 4096x2160 OpenEXR 16-bit half-float, linear color space,
 
 ### Speed
 
-| Metric | Flash Attention Only (Baseline) | All Optimizations | Improvement |
-|---|---:|---:|---:|
-| Total time (100 frames) | 1118.8 s | 785.9 s | -29.8% |
-| Effective FPS | 0.09 fps | 0.13 fps | +44.4% |
-| Avg frame time | 8423 ms | 5038 ms | -40.2% |
-| Median frame time | 8402 ms | 4979 ms | -40.7% |
+| Metric | Flash Attention Only (Baseline) | Optimized | V2 (compile) | Baseline vs V2 |
+|---|---:|---:|---:|---:|
+| Total time (100 frames) | 1118.8 s | 785.9 s | 646.5 s | -42.2% |
+| Effective FPS | 0.09 fps | 0.13 fps | 0.15 fps | +66.7% |
+| Avg frame time | 8423 ms | 5038 ms | 3946 ms | -53.1% |
+| Median frame time | 8402 ms | 4979 ms | 3563 ms | -57.6% |
+| Min frame time | -- | -- | 3198 ms | -- |
 
 ### VRAM
 
-| Metric | Baseline | Optimized | Improvement |
-|---|---:|---:|---:|
-| Dedicated VRAM (physical) | 8188 MB (maxed out) | 5166 MB | -37% |
-| PyTorch allocator reserved | 9792 MB | 1582 MB | -84% |
-| Shared GPU memory spillover | ~1604 MB | 0 MB | Eliminated |
-| Headroom within 8 GB VRAM | 0 MB | 6606 MB | -- |
+| Metric | Baseline | Optimized | V2 (compile) | Baseline vs V2 |
+|---|---:|---:|---:|---:|
+| Dedicated VRAM (physical) | 8188 MB (maxed out) | 5166 MB | 4916 MB | -40% |
+| PyTorch allocator reserved | 9792 MB | 1582 MB | 3794 MB | -61% |
+| Shared GPU memory spillover | ~1604 MB | 0 MB | 0 MB | Eliminated |
+| Headroom within 8 GB VRAM | 0 MB | 3022 MB | 3272 MB | -- |
 
-> The baseline completely saturates the 8 GB GPU and spills ~1.6 GB into shared GPU memory (system RAM accessed over PCIe), which is significantly slower than dedicated VRAM. The optimized config fits comfortably within dedicated VRAM with over 6 GB of headroom.
+> The baseline completely saturates the 8 GB GPU and spills ~1.6 GB into shared GPU memory (system RAM accessed over PCIe), which is significantly slower than dedicated VRAM. Both the optimized and v2 configs fit comfortably within dedicated VRAM.
+>
+> **Note on allocator reserved**: The `optimized` profile uses aggressive `torch.cuda.empty_cache()` between stages, which returns cached blocks to the OS (hence the very low 1,582 MB reserved). The `v2` profile disables cache clearing because in-place operations and torch.compile's fused kernels manage memory more efficiently. The allocator reserves more (3,794 MB), but actual device peak is lower (4,916 MB vs 5,166 MB) and throughput is higher.
+
+### Warmup (V2 profile)
+
+The v2 profile incurs a one-time warmup cost as torch.compile traces and compiles Triton kernels:
+
+| | First 5 avg (ms) | Last 5 avg (ms) | Warmup overhead |
+|---|---:|---:|---:|
+| V2 | 11,735 | 3,456 | +240% |
+
+After warmup, steady-state performance is 3,456 ms/frame (0.29 fps).
 
 ### Why "Flash Attention Only" as baseline?
 
@@ -64,7 +82,7 @@ https://github.com/user-attachments/assets/f4f76365-927b-4813-8944-8511d9243a42
 
 https://github.com/user-attachments/assets/625b4784-b5f9-4372-ab65-782335982ce6
 
-#### Composite Output (Baseline vs Optimized)
+#### Composite Output (Baseline vs Optimized vs V2)
 
 Baseline (Flash Attention only):
 
@@ -79,7 +97,11 @@ Optimized (all optimizations):
 https://github.com/user-attachments/assets/15ea4d9c-40c5-4db6-b197-ff1407cdf65b
 
 
-#### Alpha Matte (Baseline vs Optimized)
+V2 (optimized + torch.compile):
+
+https://github.com/Raiden129/CorridorKey_Test/raw/refs/heads/main/docs/videos/comp_v2.mp4
+
+#### Alpha Matte (Baseline vs Optimized vs V2)
 
 Baseline:
 
@@ -91,6 +113,10 @@ Optimized:
 https://github.com/user-attachments/assets/d6d46576-43a3-4bd1-a332-b530d54fe456
 
 
+V2 (optimized + torch.compile):
+
+https://github.com/Raiden129/CorridorKey_Test/raw/refs/heads/main/docs/videos/alpha_v2.mp4
+
 ---
 
 ## Optimizations Implemented
@@ -98,6 +124,7 @@ https://github.com/user-attachments/assets/d6d46576-43a3-4bd1-a332-b530d54fe456
 ### 1. Flash Attention Patching
 
 Config flag: `flash_attention: True`
+Profile: All profiles except `original`
 Impact: Required to avoid OOM at 4K on 8 GB GPUs. Without this patch, the global attention blocks materialize a full N x N attention matrix, which does not fit in memory.
 
 #### Problem
@@ -126,6 +153,7 @@ Applied in: `CorridorKeyModule/core/model_transformer.py:225-230` (during `Green
 ### 2. Tiled CNN Refiner
 
 Config flag: `tiled_refiner: True`, `tile_size: 512`, `tile_overlap: 128`
+Profile: All profiles except `original`
 Impact: Reduces VRAM usage during the refiner stage by processing the input in small tiles instead of the full 2048x2048 resolution at once.
 
 #### Problem
@@ -146,14 +174,148 @@ This is mathematically lossless because the refiner's receptive field is ~65px (
 
 If the input fits in a single tile (smaller than `tile_size`), tiling overhead is skipped entirely.
 
-Implementation: `CorridorKeyModule/core/optimized_model.py:262-364` (`TiledCNNRefiner`)
-Instantiated in: `CorridorKeyModule/core/model_transformer.py:262-275`
+The tiled refiner also deduplicates tile coordinates at image boundaries. The stride-based loop can generate overlapping boundary tiles that map to the same adjusted coordinates after clamping. A set of processed coordinates ensures each unique region is only processed once, eliminating redundant computation.
+
+Implementation: `CorridorKeyModule/core/optimized_model.py:262-383` (`TiledCNNRefiner`)
+Instantiated in: `CorridorKeyModule/core/model_transformer.py:262-276`
 
 ---
 
-### 3. cuDNN Benchmark Disable
+### 3. Sparse Tiled Refiner
+
+Config flag: `sparse_refiner: True`
+Profile: `optimized`, `v2`, `experimental`
+Impact: Skips CNN refiner processing for tiles where the coarse alpha is uniformly near 0 or near 1. On typical green screen footage, this eliminates 50-70% of tile CNN passes.
+
+#### Problem
+
+In a typical green screen shot, the majority of the frame is either pure background (alpha near 0) or pure foreground (alpha near 1). Only a thin band of edge pixels, typically around hair, fingers, and translucent edges, requires refinement. However, the standard tiled refiner processes every tile identically, spending the same GPU time on uniform-alpha tiles as on complex edge tiles.
+
+#### Solution
+
+Before running the CNN on each tile, check the coarse alpha channel of that tile:
+
+- If `alpha_tile.max() < 0.05`: the tile is pure background, skip it
+- If `alpha_tile.min() > 0.95`: the tile is pure foreground, skip it
+- Otherwise: the tile contains edges, process normally
+
+Skipped tiles contribute zero delta (the delta accumulator was initialized to zeros) and their blend weight is still accumulated so the weighted average remains correct.
+
+This is quality-safe because the CNN refiner outputs additive "delta logits", which are corrections to the existing prediction. For regions that are already confidently background or foreground, the trained refiner naturally produces near-zero deltas. Skipping these tiles substitutes exactly zero, which closely matches what the refiner would have produced.
+
+Implementation: `CorridorKeyModule/core/optimized_model.py:368-376` (sparse skip in `TiledCNNRefiner.forward()`)
+
+---
+
+### 4. In-Place Decode-and-Refine Pipeline
+
+Profile: All profiles (built into the model)
+Impact: Reduces peak activation memory by reusing tensors instead of allocating new ones for logit-space operations.
+
+#### Problem
+
+The original decode-and-refine pipeline allocated separate tensors for each step: decoder logits, upsampled logits, coarse probabilities, refiner deltas, refined logits, and final probabilities. At 2048x2048 resolution with 4 channels (1 alpha + 3 FG), each full-resolution tensor is ~64 MB in FP16. Having multiple overlapping tensor lifetimes inflates peak activation memory.
+
+#### Solution
+
+Rewrite `_decode_and_refine()` to use in-place operations and explicit `del` statements:
+
+1. **In-place residual addition**: `alpha_logits_up.add_(delta[:, 0:1])` instead of `alpha_logits_up = alpha_logits_up + delta[:, 0:1]`
+2. **In-place sigmoid**: `alpha_logits_up.sigmoid_()` instead of `alpha = torch.sigmoid(alpha_logits_up)`
+3. **In-place refiner scaling**: `delta_logits.mul_(refiner_scale)` when scale != 1.0
+4. **Explicit tensor cleanup**: `del alpha_logits, fg_logits` after upsample frees the H/4 resolution tensors immediately; `del alpha_coarse, fg_coarse` after building the refiner input; `del delta_logits` after the residual add
+
+These in-place operations require `torch.inference_mode()` context (which disables autograd version counting).
+
+The `refiner_scale` parameter is passed directly through `forward()` instead of using a forward hook, keeping the compiled graph clean.
+
+Implementation: `CorridorKeyModule/core/model_transformer.py:291-344` (`_decode_and_refine()`)
+
+---
+
+### 5. channels_last Memory Format
+
+Profile: All profiles on CUDA
+Impact: Improves CUDA convolution kernel selection and memory access patterns.
+
+#### Problem
+
+PyTorch defaults to NCHW (channels-first) memory layout. NVIDIA's cuDNN and Triton kernels often perform better with NHWC (channels-last) layout because it produces more coalesced memory accesses for convolution and batch normalization operations.
+
+#### Solution
+
+After model loading, convert the model and input tensors to channels_last memory format:
+
+```python
+self.model = self.model.to(memory_format=torch.channels_last)
+inp_t = inp_t.to(memory_format=torch.channels_last)
+```
+
+This is a metadata-only operation on the model (no weight copy occurs). The tensor data is transposed, but cuDNN and Triton automatically select kernels optimized for NHWC layout.
+
+Implementation: `CorridorKeyModule/base_engine.py:58-60` (model), `base_engine.py:237-238` (input tensor)
+
+---
+
+### 6. torch.inference_mode()
+
+Profile: All profiles
+Impact: Enables in-place operations and reduces per-tensor overhead by disabling autograd bookkeeping.
+
+#### Problem
+
+`torch.no_grad()` disables gradient computation but still tracks tensor versions for autograd safety. This prevents in-place operations from being used freely and adds overhead to every tensor allocation.
+
+#### Solution
+
+Replace `@torch.no_grad()` with `@torch.inference_mode()` on `process_frame()`. Inference mode:
+
+- Disables gradient computation (same as `no_grad`)
+- Disables autograd version counting, allowing safe in-place operations (`.add_()`, `.sigmoid_()`, `.mul_()`)
+- Reduces per-tensor metadata overhead
+
+Implementation: `CorridorKeyModule/base_engine.py:175` (`@torch.inference_mode()` decorator on `process_frame()`)
+
+---
+
+### 7. torch.compile Sub-Module Compilation
+
+Config flag: `compile_submodules: True`
+Profile: `v2`, `experimental`
+Requires: [Triton](https://github.com/triton-lang/triton) (install `triton-windows` on Windows)
+Impact: 34% faster median frame time through Triton kernel fusion. Reduces intermediate tensor materializations.
+
+#### Problem
+
+Eager-mode PyTorch executes each operation individually, launching a separate CUDA kernel for each Conv2d, GroupNorm, ReLU, linear projection, etc. Each kernel launch has dispatch overhead (~5-10 us), and intermediate results are materialized in VRAM between operations even when they could be fused.
+
+#### Solution
+
+Apply `torch.compile()` to individual sub-modules rather than the full model:
+
+```python
+self.model.encoder = torch.compile(self.model.encoder)
+self.model.alpha_decoder = torch.compile(self.model.alpha_decoder)
+self.model.fg_decoder = torch.compile(self.model.fg_decoder)
+self.model.refiner._process_tile = torch.compile(self.model.refiner._process_tile)
+```
+
+**Why sub-modules, not the full model?** The orchestration code in `_decode_and_refine()` contains control flow (conditional refiner_scale, `del` statements, in-place ops) and the tiled refiner uses Python loops with dynamic tile coordinates, all of which cause graph breaks in torch.compile. Compiling sub-modules individually keeps each compiled graph clean and break-free.
+
+**Why not CUDA graphs?** Hiera's `forward_intermediates()` stores intermediate feature tensors at each stage boundary. CUDA graphs capture and replay GPU operations, but the stored tensors get overwritten on replay, causing `RuntimeError: accessing tensor output of CUDAGraphs that has been overwritten`. CUDA graphs are explicitly disabled via `inductor_config.triton.cudagraphs = False`.
+
+**What gets fused**: Conv-GroupNorm-ReLU chains in the refiner, transformer block internals (LayerNorm-Linear-GELU sequences), element-wise operations, and attention projections. The Triton compiler generates custom GPU kernels that fuse these operation sequences, avoiding intermediate tensor materializations.
+
+**Warmup**: The first ~5 frames incur 2-3x overhead as Triton traces and compiles kernels. The `suppress_errors = True` setting ensures graceful fallback to eager mode if any graph fails to compile.
+
+Implementation: `CorridorKeyModule/base_engine.py:66-97` (`_compile_submodules()`)
+
+---
+
+### 8. cuDNN Benchmark Disable
 
 Config flag: `disable_cudnn_benchmark: True`
+Profile: All profiles except `original`
 Impact: Reduces VRAM used by cuDNN workspace allocations during convolution benchmarking.
 
 #### Problem
@@ -168,9 +330,10 @@ Implementation: `CorridorKeyModule/base_engine.py:52-54`
 
 ---
 
-### 4. CUDA Cache Clearing
+### 9. CUDA Cache Clearing
 
 Config flag: `cache_clearing: True`
+Profile: `optimized` only (disabled in `v2` where in-place ops manage memory)
 Impact: Prevents memory accumulation between pipeline stages.
 
 #### Problem
@@ -181,18 +344,18 @@ With the encoder, decoder, and refiner stages each having different tensor shape
 
 #### Solution
 
-Call `torch.cuda.empty_cache()` at two strategic points in the inference pipeline:
+Call `torch.cuda.empty_cache()` at two strategic points in the inference pipeline (before and after model inference) at the engine level.
 
-1. Between encoder and decoder (`model_transformer.py:349-351`)
-2. Between decoder and refiner (`model_transformer.py:314-315`)
+**Note**: In the `v2` profile, cache clearing is disabled. The combination of in-place operations (which reuse existing tensor memory instead of allocating new tensors) and torch.compile's fused kernels (which reduce intermediate allocations) makes cache clearing unnecessary. Disabling it avoids the `cudaFree`/`cudaMalloc` overhead on every frame.
 
-This releases intermediate CUDA allocations back to the OS between stages, so each stage only needs to hold its own tensors rather than the accumulated cache from all previous stages.
+Implementation: `CorridorKeyModule/base_engine.py:242-258` (engine-level cache clearing)
 
 ---
 
-### 5. Token Routing (Experimental)
+### 10. Token Routing (Experimental)
 
 Config flag: `token_routing: True`
+Profile: `experimental` only
 Status: Experimental, disabled by default. Requires fine-tuning for production use.
 
 #### Concept
@@ -217,7 +380,8 @@ Implementation: `CorridorKeyModule/core/optimized_model.py:101-254` (LTRM, ECA, 
 ```
 _BaseCorridorKeyEngine (base_engine.py)
     Abstract base class: constructor, checkpoint loading,
-    process_frame() pipeline, cuDNN disable, metrics
+    process_frame() pipeline, cuDNN disable, channels_last,
+    torch.compile, inference_mode, metrics
     |
     |--- CorridorKeyEngine (inference_engine.py)
     |       Original engine. Uses GreenFormer directly.
@@ -225,7 +389,7 @@ _BaseCorridorKeyEngine (base_engine.py)
     |
     |--- OptimizedCorridorKeyEngine (optimized_engine.py)
             Optimized engine. Uses OptimizedGreenFormer.
-            Defaults to OptimizationConfig.optimized() (4 production opts on)
+            Defaults to OptimizationConfig.optimized() (production opts on)
 ```
 
 ### Model Hierarchy
@@ -233,7 +397,8 @@ _BaseCorridorKeyEngine (base_engine.py)
 ```
 GreenFormer (model_transformer.py)
     Base model: Hiera backbone, multiscale decoders, CNN refiner
-    Handles: FlashAttention patching, tiled refiner, cache clearing
+    Handles: FlashAttention patching, tiled refiner, in-place
+    decode-and-refine, refiner_scale parameter
     |
     |--- OptimizedGreenFormer (optimized_model.py)
             Extends GreenFormer with token routing machinery
@@ -243,7 +408,7 @@ GreenFormer (model_transformer.py)
 
 ### Design Principle
 
-Optimizations are config-driven, not engine-driven. Both engines accept any `OptimizationConfig`. The `GreenFormer` base model handles FlashAttention, tiled refiner, and cache clearing based on the config, so even the "original" `CorridorKeyEngine` can use these optimizations if given the right config. The `OptimizedCorridorKeyEngine` simply defaults to the optimized profile and adds LTRM weight handling.
+Optimizations are config-driven, not engine-driven. Both engines accept any `OptimizationConfig`. The `GreenFormer` base model handles FlashAttention, tiled refiner, sparse skip, and in-place operations based on the config, so even the "original" `CorridorKeyEngine` can use these optimizations if given the right config. The `_BaseCorridorKeyEngine` handles channels_last, inference_mode, torch.compile, and cache clearing at the engine level. The `OptimizedCorridorKeyEngine` simply defaults to the optimized profile and adds LTRM weight handling.
 
 ### Inference Pipeline
 
@@ -260,22 +425,43 @@ Input (4096x2160 EXR, linear float)
 [ImageNet normalization + alpha hint concat -> 4-channel input]
   |
   v
+[channels_last conversion] (CUDA only)
+  |
+  v
+[torch.cuda.empty_cache()] (if cache_clearing)
+  |
+  v
 [Hiera Encoder]    Stages 0-1: Windowed attention (efficient)
   |                Stages 2-3: Global attention (FlashAttention patched)
+  |                (torch.compile'd if compile_submodules)
+  v
+[Multiscale Decoder]    Predicts coarse alpha (1ch) + coarse FG (3ch) at H/4
+  |                     (torch.compile'd if compile_submodules)
   |
-  |-- torch.cuda.empty_cache() (if cache_clearing)
+  |-- del H/4 tensors (in-place pipeline)
   |
   v
-[Multiscale Decoder]    Predicts coarse alpha (1ch) + coarse FG (3ch)
-  |
-  |-- torch.cuda.empty_cache() (if cache_clearing)
+[F.interpolate to full resolution]
   |
   v
-[CNN Refiner / TiledCNNRefiner]    7ch input (RGB + coarse predictions)
-  |                                Produces additive delta logits
-  |                                (512x512 tiles if tiled_refiner)
+[sigmoid -> coarse probs -> cat -> refiner input]
+  |
+  |-- del coarse probs (in-place pipeline)
+  |
   v
-[Sigmoid activation]
+[TiledCNNRefiner]    7ch input (RGB + coarse predictions)
+  |                  512x512 tiles, 128px overlap
+  |                  Sparse skip: uniform-alpha tiles skipped
+  |                  Dedup: boundary tiles processed once
+  |                  (torch.compile'd _process_tile if compile_submodules)
+  v
+[In-place residual add in logit space]  logits.add_(delta * refiner_scale)
+  |
+  v
+[In-place sigmoid activation]  logits.sigmoid_()
+  |
+  v
+[torch.cuda.empty_cache()] (if cache_clearing)
   |
   v
 [Lanczos4 resize back to 4096x2160]
@@ -301,25 +487,33 @@ In `CorridorKeyModule/backend.py`, the system auto-detects the optimal engine:
 
 ### OptimizationConfig Profiles
 
-| Profile | `flash_attention` | `tiled_refiner` | `disable_cudnn_benchmark` | `cache_clearing` | `token_routing` |
-|---|:---:|:---:|:---:|:---:|:---:|
-| `original` | off | off | off | off | off |
-| `optimized` (production) | on | on | on | on | off |
-| `experimental` | on | on | on | on | on |
+| Profile | `flash_attention` | `tiled_refiner` | `sparse_refiner` | `disable_cudnn_benchmark` | `cache_clearing` | `compile_submodules` | `token_routing` |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| `original` | off | off | off | off | off | off | off |
+| `optimized` (production) | on | on | on | on | on | off | off |
+| `v2` | on | on | on | on | off | on | off |
+| `experimental` | on | on | on | on | off | on | on |
+
+**Profile selection guide**:
+- `optimized`: Safe, no compilation warmup, works without Triton. Best for interactive use.
+- `v2`: Fastest steady-state throughput. Requires Triton (`triton-windows` on Windows). ~10s warmup on first frames.
+- `experimental`: Includes untrained token routing. For development only.
 
 ### CLI Flags
 
 ```bash
-# Use optimized profile (default for GPUs with less than 16GB)
-uv run python corridorkey_cli.py --action run_inference --flash-attention --tiled-refiner --disable-cudnn-benchmark --cache-clearing
+# Use a named profile
+uv run python corridorkey_cli.py --action run_inference --profile v2
 
-# Individual toggles
+# Individual toggles (override profile settings)
 --flash-attention / --no-flash-attention
 --tiled-refiner / --no-tiled-refiner
+--sparse-refiner / --no-sparse-refiner
 --tile-size N          # default: 512
 --tile-overlap N       # default: 128
 --disable-cudnn-benchmark / --no-disable-cudnn-benchmark
 --cache-clearing / --no-cache-clearing
+--compile / --no-compile
 --token-routing / --no-token-routing
 --metrics              # enable per-stage timing/VRAM reporting
 ```
@@ -330,17 +524,22 @@ uv run python corridorkey_cli.py --action run_inference --flash-attention --tile
 from CorridorKeyModule.optimization_config import OptimizationConfig
 from CorridorKeyModule.optimized_engine import OptimizedCorridorKeyEngine
 
-# Production config (4 optimizations)
+# Production config (no compile warmup)
 config = OptimizationConfig.optimized()
+
+# V2 config (fastest, requires Triton)
+config = OptimizationConfig.v2()
 
 # Custom config
 config = OptimizationConfig(
     flash_attention=True,
     tiled_refiner=True,
+    sparse_refiner=True,
     tile_size=512,
     tile_overlap=128,
     disable_cudnn_benchmark=True,
-    cache_clearing=True,
+    cache_clearing=False,
+    compile_submodules=True,
     enable_metrics=True,
 )
 
@@ -390,10 +589,16 @@ Script: `tears_of_steel_test/generate_alpha_hints.py`
 
 ### Benchmark Script
 
-`benchmark_4k_vram.py` runs each configuration in a separate subprocess to ensure clean GPU state:
+`benchmark_4k_vram.py` runs each configuration in a separate subprocess to ensure clean GPU state. Supports configurable profile selection:
 
-1. Flash Attention Only (baseline), the minimum viable config
-2. All Optimizations: flash + tiled refiner + cuDNN disable + cache clearing
+```bash
+uv run python benchmark_4k_vram.py --profile v2           # single profile (default)
+uv run python benchmark_4k_vram.py --profile baseline v2  # compare two profiles
+uv run python benchmark_4k_vram.py --profile all           # compare all three
+uv run python benchmark_4k_vram.py --frames 50             # fewer frames
+```
+
+Available profiles: `baseline` (Flash Attention only), `optimized`, `v2` (compile), `all` (run all three).
 
 For each config, it measures:
 - Per-frame wall-clock time (ms)
@@ -425,13 +630,10 @@ When allocator reserved exceeds physical VRAM, Windows spills into shared GPU me
 Output/
   comp_baseline/          # Processed RGBA EXR sequence (baseline)
   comp_optimized/         # Processed RGBA EXR sequence (optimized)
+  comp_v2/                # Processed RGBA EXR sequence (v2)
   alpha_baseline/         # Alpha matte EXR sequence (baseline)
   alpha_optimized/        # Alpha matte EXR sequence (optimized)
-  raw_greenscreen_h264.mp4    # Original footage (H.264, for viewing)
-  comp_baseline_h264.mp4      # Composite preview (baseline, H.264)
-  comp_optimized_h264.mp4     # Composite preview (optimized, H.264)
-  alpha_baseline_h264.mp4     # Alpha matte preview (baseline, H.264)
-  alpha_optimized_h264.mp4    # Alpha matte preview (optimized, H.264)
+  alpha_v2/               # Alpha matte EXR sequence (v2)
 ```
 
 ### EXR Output Format
@@ -469,13 +671,33 @@ uv run python tears_of_steel_test/generate_alpha_hints.py
 
 Generates coarse alpha hints using HSV chroma keying.
 
-### 3. Run benchmark
+### 3. Install Triton (required for v2 profile)
 
 ```bash
-uv run python benchmark_4k_vram.py
+# Windows
+uv pip install triton-windows
+
+# Linux
+uv pip install triton
 ```
 
-Processes all 100 frames through both configurations, generates the report at `benchmark_4k_results.md`, and writes output EXR sequences to `Output/`.
+### 4. Run benchmark
+
+```bash
+# Run v2 profile (default)
+uv run python benchmark_4k_vram.py
+
+# Run specific profile
+uv run python benchmark_4k_vram.py --profile optimized
+
+# Compare all profiles
+uv run python benchmark_4k_vram.py --profile all
+
+# Fewer frames for a quick test
+uv run python benchmark_4k_vram.py --profile v2 --frames 10
+```
+
+Processes frames through the selected configuration(s), generates the report at `benchmark_4k_results.md`, and writes output EXR sequences to `Output/`.
 
 ---
 
@@ -483,11 +705,11 @@ Processes all 100 frames through both configurations, generates the report at `b
 
 | File | Purpose |
 |---|---|
-| `CorridorKeyModule/optimization_config.py` | `OptimizationConfig` dataclass, profiles, `PerformanceMetrics` |
-| `CorridorKeyModule/base_engine.py` | `_BaseCorridorKeyEngine` abstract base class |
+| `CorridorKeyModule/optimization_config.py` | `OptimizationConfig` dataclass, profiles (`original`, `optimized`, `v2`, `experimental`), `PerformanceMetrics` |
+| `CorridorKeyModule/base_engine.py` | `_BaseCorridorKeyEngine`: inference_mode, channels_last, torch.compile, cache clearing, refiner_scale |
 | `CorridorKeyModule/optimized_engine.py` | `OptimizedCorridorKeyEngine` with LTRM weight handling |
-| `CorridorKeyModule/core/optimized_model.py` | FlashAttention patch, TiledCNNRefiner, LTRM, ECA, TokenRouter |
-| `CorridorKeyModule/core/model_transformer.py` | `GreenFormer` model (applies FA, tiling, cache clearing) |
+| `CorridorKeyModule/core/optimized_model.py` | FlashAttention patch, TiledCNNRefiner (dedup + sparse), LTRM, ECA, TokenRouter |
+| `CorridorKeyModule/core/model_transformer.py` | `GreenFormer` model: in-place `_decode_and_refine()`, refiner_scale parameter |
 | `CorridorKeyModule/backend.py` | Auto-backend selection based on GPU VRAM |
-| `benchmark_4k_vram.py` | 4K benchmark script |
+| `benchmark_4k_vram.py` | 4K benchmark script (configurable profiles) |
 | `benchmark_4k_results.md` | Latest benchmark results |

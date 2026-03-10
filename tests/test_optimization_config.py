@@ -45,11 +45,12 @@ class TestOptimizationConfigProfiles:
         assert cfg.flash_attention is True
         assert cfg.tiled_refiner is True
         assert cfg.disable_cudnn_benchmark is True
-        assert cfg.cache_clearing is True
+        assert cfg.cache_clearing is False  # Disabled: torch.compile manages memory
         assert cfg.token_routing is True
+        assert cfg.compile_submodules is True
 
     def test_from_profile_valid_names(self):
-        for name in ("original", "optimized", "experimental"):
+        for name in ("original", "optimized", "v2", "experimental"):
             cfg = OptimizationConfig.from_profile(name)
             assert isinstance(cfg, OptimizationConfig)
 
@@ -97,9 +98,10 @@ class TestOptimizationConfigHelpers:
     def test_active_optimizations_optimized(self):
         cfg = OptimizationConfig.optimized()
         active = cfg.active_optimizations()
-        assert len(active) == 4
+        assert len(active) == 5
         assert "flash_attention" in active
         assert any("tiled_refiner" in a for a in active)
+        assert "sparse_refiner" in active
         assert "disable_cudnn_benchmark" in active
         assert "cache_clearing" in active
 

@@ -143,7 +143,7 @@ def mock_greenformer():
     No GPU or model weights needed.
     """
 
-    def fake_forward(x):
+    def fake_forward(x, **kwargs):
         b, c, h, w = x.shape
         return {
             "alpha": torch.full((b, 1, h, w), 0.8),

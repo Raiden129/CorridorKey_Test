@@ -41,6 +41,11 @@ class OptimizationConfig:
     2048 x 2048 resolution.  Mathematically lossless given the 128 px
     overlap exceeds the refiner's ~65 px receptive field."""
 
+    sparse_refiner: bool = False
+    """Skip CNN refiner processing for tiles whose coarse alpha is
+    uniformly near 0 or near 1 (pure background / foreground).
+    Only active when ``tiled_refiner`` is also ``True``."""
+
     disable_cudnn_benchmark: bool = False
     """Set ``torch.backends.cudnn.benchmark = False`` to prevent cuDNN from
     allocating workspace memory for benchmark runs (saves 2-5 GB)."""
@@ -82,6 +87,11 @@ class OptimizationConfig:
     """When ``True``, collect per-stage timing and VRAM usage metrics.
     Results are returned in the ``"metrics"`` key of the output dict."""
 
+    compile_submodules: bool = False
+    """Apply ``torch.compile`` to encoder, decoders, and refiner
+    sub-modules for kernel fusion and reduced dispatch overhead.
+    First frame incurs a 30-120 s compilation warmup."""
+
     # ------------------------------------------------------------------
     # Profiles
     # ------------------------------------------------------------------
@@ -94,23 +104,42 @@ class OptimizationConfig:
     @classmethod
     def optimized(cls) -> OptimizationConfig:
         """Standard optimized profile: flash_attention + tiled_refiner +
-        disable_cudnn_benchmark + cache_clearing.  No token routing."""
+        sparse_refiner + disable_cudnn_benchmark + cache_clearing.
+        No token routing or torch.compile."""
         return cls(
             flash_attention=True,
             tiled_refiner=True,
+            sparse_refiner=True,
             disable_cudnn_benchmark=True,
             cache_clearing=True,
             token_routing=False,
         )
 
     @classmethod
-    def experimental(cls) -> OptimizationConfig:
-        """All optimizations enabled, including token routing."""
+    def v2(cls) -> OptimizationConfig:
+        """Phase 1+2 optimizations: all of ``optimized()`` plus
+        ``torch.compile`` on sub-modules.  Cache clearing disabled
+        because in-place operations manage activation memory."""
         return cls(
             flash_attention=True,
             tiled_refiner=True,
+            sparse_refiner=True,
             disable_cudnn_benchmark=True,
-            cache_clearing=True,
+            cache_clearing=False,
+            compile_submodules=True,
+            token_routing=False,
+        )
+
+    @classmethod
+    def experimental(cls) -> OptimizationConfig:
+        """All optimizations enabled, including token routing and torch.compile."""
+        return cls(
+            flash_attention=True,
+            tiled_refiner=True,
+            sparse_refiner=True,
+            disable_cudnn_benchmark=True,
+            cache_clearing=False,
+            compile_submodules=True,
             token_routing=True,
         )
 
@@ -124,6 +153,7 @@ class OptimizationConfig:
         profiles: dict[str, classmethod] = {
             "original": cls.original,
             "optimized": cls.optimized,
+            "v2": cls.v2,
             "experimental": cls.experimental,
         }
         if name not in profiles:
@@ -141,10 +171,14 @@ class OptimizationConfig:
             names.append("flash_attention")
         if self.tiled_refiner:
             names.append(f"tiled_refiner({self.tile_size}x{self.tile_size}/{self.tile_overlap}px)")
+        if self.sparse_refiner:
+            names.append("sparse_refiner")
         if self.disable_cudnn_benchmark:
             names.append("disable_cudnn_benchmark")
         if self.cache_clearing:
             names.append("cache_clearing")
+        if self.compile_submodules:
+            names.append("compile_submodules")
         if self.token_routing:
             names.append(f"token_routing(edge={self.edge_threshold_low}-{self.edge_threshold_high})")
         return names

@@ -274,10 +274,12 @@ class TiledCNNRefiner(CNNRefinerModule):
         out_channels: int = 4,
         tile_size: int = 512,
         tile_overlap: int = 128,
+        sparse: bool = False,
     ) -> None:
         super().__init__(in_channels, hidden_channels, out_channels)
         self.tile_size = tile_size
         self.tile_overlap = tile_overlap
+        self.sparse = sparse
 
     def _create_blend_weight(
         self, h: int, w: int, overlap: int, device: torch.device, dtype: torch.dtype
@@ -321,7 +323,7 @@ class TiledCNNRefiner(CNNRefinerModule):
         return self.final(feat) * 10.0
 
     def forward(self, img: torch.Tensor, coarse_pred: torch.Tensor) -> torch.Tensor:
-        """Tiled forward pass.
+        """Tiled forward pass with duplicate-tile deduplication and sparse skip.
 
         Args:
             img: [B, 3, H, W]
@@ -343,6 +345,9 @@ class TiledCNNRefiner(CNNRefinerModule):
         delta_sum = torch.zeros(B, out_channels, H, W, device=img.device, dtype=img.dtype)
         weight_sum = torch.zeros(B, 1, H, W, device=img.device, dtype=img.dtype)
 
+        # Track processed coordinates to avoid duplicate tiles at boundaries
+        processed_coords: set[tuple[int, int, int, int]] = set()
+
         for y0 in range(0, H, stride):
             for x0 in range(0, W, stride):
                 y1 = min(y0 + self.tile_size, H)
@@ -351,11 +356,27 @@ class TiledCNNRefiner(CNNRefinerModule):
                 y0_adj = max(0, y1 - self.tile_size)
                 x0_adj = max(0, x1 - self.tile_size)
 
+                # Deduplicate: skip if we already processed this exact region
+                coords = (y0_adj, y1, x0_adj, x1)
+                if coords in processed_coords:
+                    continue
+                processed_coords.add(coords)
+
+                tile_h, tile_w = y1 - y0_adj, x1 - x0_adj
+                blend_w = self._create_blend_weight(tile_h, tile_w, self.tile_overlap, img.device, img.dtype)
+
+                # Sparse skip: if tile alpha is uniformly BG or FG, the refiner
+                # delta is effectively zero — skip the expensive CNN pass.
+                if self.sparse:
+                    alpha_tile = coarse_pred[:, 0:1, y0_adj:y1, x0_adj:x1]
+                    if alpha_tile.max().item() < 0.05 or alpha_tile.min().item() > 0.95:
+                        # Accumulate weight so the weighted average stays correct,
+                        # but don't add to delta_sum (it was initialised to zeros).
+                        weight_sum[:, :, y0_adj:y1, x0_adj:x1] += blend_w
+                        continue
+
                 tile = full_input[:, :, y0_adj:y1, x0_adj:x1]
                 tile_delta = self._process_tile(tile)
-
-                tile_h, tile_w = tile_delta.shape[2], tile_delta.shape[3]
-                blend_w = self._create_blend_weight(tile_h, tile_w, self.tile_overlap, img.device, img.dtype)
 
                 delta_sum[:, :, y0_adj:y1, x0_adj:x1] += tile_delta * blend_w
                 weight_sum[:, :, y0_adj:y1, x0_adj:x1] += blend_w
@@ -563,7 +584,7 @@ class OptimizedGreenFormer(GreenFormer):
     # Forward
     # ------------------------------------------------------------------
 
-    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward(self, x: torch.Tensor, refiner_scale: float = 1.0) -> dict[str, torch.Tensor]:
         """Forward pass with optional token routing.
 
         When ``config.token_routing`` is ``False``, delegates entirely to
@@ -571,7 +592,7 @@ class OptimizedGreenFormer(GreenFormer):
         FlashAttention, tiled refiner, and cache clearing via the config).
         """
         if not self.config.token_routing:
-            return super().forward(x)
+            return super().forward(x, refiner_scale=refiner_scale)
 
         # --- Token routing path ---
         input_size = x.shape[2:]
@@ -579,8 +600,4 @@ class OptimizedGreenFormer(GreenFormer):
 
         features = self._forward_encoder_with_routing(x, alpha_hint)
 
-        # Cache clearing between encoder and decoder
-        if self.config.cache_clearing and x.is_cuda:
-            torch.cuda.empty_cache()
-
-        return self._decode_and_refine(features, x, input_size)
+        return self._decode_and_refine(features, x, input_size, refiner_scale=refiner_scale)

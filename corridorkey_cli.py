@@ -309,7 +309,7 @@ def main() -> None:
     # --- Optimization profile & per-optimization flags ---
     parser.add_argument(
         "--profile",
-        choices=["original", "optimized", "experimental"],
+        choices=["original", "optimized", "v2", "experimental"],
         default=None,
         help="Optimization profile (default: inferred from --backend). "
         "Per-optimization flags below override profile settings.",
@@ -324,6 +324,10 @@ def main() -> None:
     parser.add_argument("--no-disable-cudnn-benchmark", dest="disable_cudnn_benchmark", action="store_false")
     parser.add_argument("--token-routing", action="store_true", default=None, help="Enable experimental token routing")
     parser.add_argument("--no-token-routing", dest="token_routing", action="store_false")
+    parser.add_argument("--sparse-refiner", action="store_true", default=None, help="Skip uniform-alpha tiles in tiled refiner")
+    parser.add_argument("--no-sparse-refiner", dest="sparse_refiner", action="store_false")
+    parser.add_argument("--compile", action="store_true", default=None, help="Enable torch.compile on sub-modules")
+    parser.add_argument("--no-compile", dest="compile_submodules", action="store_false")
     parser.add_argument("--tile-size", type=int, default=None, help="Tile size for tiled refiner (default: 512)")
     parser.add_argument("--tile-overlap", type=int, default=None, help="Tile overlap in pixels (default: 128)")
     parser.add_argument("--metrics", action="store_true", default=False, help="Enable per-stage performance metrics")
@@ -386,9 +390,11 @@ def _build_optimization_config(args):
                 for attr in (
                     "flash_attention",
                     "tiled_refiner",
+                    "sparse_refiner",
                     "cache_clearing",
                     "disable_cudnn_benchmark",
                     "token_routing",
+                    "compile_submodules",
                     "tile_size",
                     "tile_overlap",
                 )
@@ -411,6 +417,10 @@ def _build_optimization_config(args):
         overrides["disable_cudnn_benchmark"] = args.disable_cudnn_benchmark
     if args.token_routing is not None:
         overrides["token_routing"] = args.token_routing
+    if getattr(args, "sparse_refiner", None) is not None:
+        overrides["sparse_refiner"] = args.sparse_refiner
+    if getattr(args, "compile_submodules", None) is not None:
+        overrides["compile_submodules"] = args.compile_submodules
     if args.tile_size is not None:
         overrides["tile_size"] = args.tile_size
     if args.tile_overlap is not None:

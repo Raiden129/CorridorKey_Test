@@ -1,23 +1,34 @@
-"""4K Benchmark: Flash Attention baseline vs All Optimizations.
+"""4K Benchmark: Configurable profile benchmarking for CorridorKey.
 
 Processes real 4K green-screen footage (Tears of Steel, 4096x2160 EXR frames
-in linear color space) through two configurations:
-  1. Flash Attention only  (proxy for "original" -- FA required to avoid OOM)
-  2. All Optimizations     (flash + tiled refiner + cache clearing + cuDNN disable)
+in linear color space) through a selected optimization profile.
+
+Available profiles:
+  - baseline    Flash Attention only (minimum required to avoid OOM on 8 GB)
+  - optimized   Flash + tiled refiner + cache clearing + cuDNN disable + sparse refiner
+  - v2          All optimized + torch.compile sub-modules, cache clearing disabled
+  - all         Run baseline + optimized + v2 and generate comparison report
 
 Each config runs in its own subprocess.  Outputs comp and alpha EXR sequences
-for each config so quality can be compared.
+for quality inspection.
 
 Source footage:
   Tears of Steel (CC-BY 3.0) (c) Blender Foundation | mango.blender.org
   https://media.xiph.org/tearsofsteel/tearsofsteel-footage-exr/02_3c/linear/
 
 Usage:
-    uv run python benchmark_4k_vram.py
+    uv run python benchmark_4k_vram.py                   # defaults to v2
+    uv run python benchmark_4k_vram.py --profile v2
+    uv run python benchmark_4k_vram.py --profile optimized
+    uv run python benchmark_4k_vram.py --profile baseline
+    uv run python benchmark_4k_vram.py --profile all     # compare all profiles
+    uv run python benchmark_4k_vram.py --profile baseline v2  # compare two
+    uv run python benchmark_4k_vram.py --frames 50       # fewer frames
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import subprocess
@@ -33,17 +44,27 @@ FRAMES_DIR = os.path.join("tears_of_steel_test", "frames")
 HINT_DIR = os.path.join("tears_of_steel_test", "alpha_hints")
 OUTPUT_DIR = "Output"
 REPORT_PATH = "benchmark_4k_results.md"
-NUM_FRAMES = 100  # first 100 frames from the sequence
 
-CONFIGS: list[tuple[str, dict, str]] = [
-    ("Flash Attention Only (baseline)", {"flash_attention": True}, "baseline"),
-    ("All Optimizations", {
+PROFILE_CONFIGS: dict[str, tuple[str, dict]] = {
+    "baseline": ("Flash Attention Only (baseline)", {
+        "flash_attention": True,
+    }),
+    "optimized": ("All Optimizations", {
         "flash_attention": True,
         "tiled_refiner": True,
         "disable_cudnn_benchmark": True,
         "cache_clearing": True,
-    }, "optimized"),
-]
+        "sparse_refiner": True,
+    }),
+    "v2": ("V2 (optimized + torch.compile)", {
+        "flash_attention": True,
+        "tiled_refiner": True,
+        "disable_cudnn_benchmark": True,
+        "cache_clearing": False,
+        "sparse_refiner": True,
+        "compile_submodules": True,
+    }),
+}
 
 # ---------------------------------------------------------------------------
 # Worker script (runs in subprocess)
@@ -336,16 +357,16 @@ print(json.dumps(result))
 # ---------------------------------------------------------------------------
 
 
-def run_config(label: str, config_fields: dict, tag: str) -> dict:
+def run_config(label: str, config_fields: dict, tag: str, num_frames: int) -> dict:
     print(f"\n{'='*60}")
     print(f"  BENCHMARK: {label}")
-    print(f"  Processing {NUM_FRAMES} 4K EXR frames (Tears of Steel)")
+    print(f"  Processing {num_frames} 4K EXR frames (Tears of Steel)")
     print(f"{'='*60}")
 
     config_json = json.dumps(config_fields)
     cmd = [
         sys.executable, "-c", WORKER_SCRIPT,
-        config_json, CKPT, FRAMES_DIR, OUTPUT_DIR, tag, HINT_DIR, str(NUM_FRAMES),
+        config_json, CKPT, FRAMES_DIR, OUTPUT_DIR, tag, HINT_DIR, str(num_frames),
     ]
 
     start = time.time()
@@ -388,10 +409,10 @@ def run_config(label: str, config_fields: dict, tag: str) -> dict:
     return result
 
 
-def generate_report(results: list[dict], gpu_info: str) -> str:
-    L = []
-    baseline = next((r for r in results if r.get("tag") == "baseline"), None)
-    optimized = next((r for r in results if r.get("tag") == "optimized"), None)
+def generate_report(results: list[dict], gpu_info: str, num_frames: int) -> str:
+    L: list[str] = []
+    ok_results = [r for r in results if r.get("status") == "OK"]
+    is_comparison = len(ok_results) > 1
 
     L.append("# CorridorKey 4K Benchmark — Tears of Steel")
     L.append("")
@@ -400,130 +421,147 @@ def generate_report(results: list[dict], gpu_info: str) -> str:
     L.append("- **Source footage**: Tears of Steel (scene 02_3c) — CC-BY 3.0 (c) Blender Foundation | mango.blender.org")
     L.append("- **Format**: OpenEXR 16-bit half-float, linear color space")
     L.append("- **Resolution**: 4096x2160 (DCI 4K)")
-    L.append(f"- **Frames**: {NUM_FRAMES} (24 fps, ~{NUM_FRAMES/24:.1f} seconds)")
+    L.append(f"- **Frames**: {num_frames} (24 fps, ~{num_frames/24:.1f} seconds)")
     L.append("- **Model input size**: 2048x2048")
     L.append(f"- **GPU**: {gpu_info}")
     L.append("- **Alpha hints**: HSV chroma key (auto-generated from green screen footage)")
-    L.append("- **Color pipeline**: `input_is_linear=True` — engine handles linear→sRGB conversion internally")
+    L.append("- **Color pipeline**: `input_is_linear=True` — engine handles linear->sRGB conversion internally")
+    L.append(f"- **Profiles benchmarked**: {', '.join(r.get('tag', '?') for r in ok_results)}")
     L.append("")
     L.append("> **Note**: The original engine OOMs at 4K on 8 GB GPUs. Flash Attention is the")
     L.append("> minimum required optimization. The \"baseline\" config uses Flash Attention only")
     L.append("> to serve as the closest proxy to original behavior while remaining runnable.")
     L.append("")
 
-    # --- Head-to-head comparison ---
-    L.append("---")
-    L.append("")
-    L.append("## Head-to-Head Comparison")
-    L.append("")
+    # --- Comparison table (multiple profiles) ---
+    if is_comparison:
+        L.append("---")
+        L.append("")
+        L.append("## Comparison")
+        L.append("")
 
-    if baseline and optimized:
-        b, o = baseline, optimized
-        L.append("| Metric | Flash Attention Only (Baseline) | All Optimizations | Delta |")
-        L.append("|---|---:|---:|---:|")
+        # Build header
+        header_cols = ["Metric"] + [r["label"] for r in ok_results]
+        if len(ok_results) == 2:
+            header_cols.append("Delta")
+        L.append("| " + " | ".join(header_cols) + " |")
+        L.append("|---" + "|---:" * (len(header_cols) - 1) + "|")
 
-        def row(label, bv, ov, unit="", fmt=".1f"):
-            if isinstance(bv, (int, float)) and isinstance(ov, (int, float)):
-                delta = ov - bv
-                if bv != 0:
-                    pct = (delta / bv) * 100
+        def comp_row(label: str, key: str, unit: str = "", fmt: str = ".1f"):
+            vals = [r.get(key, 0) for r in ok_results]
+            cols = [label] + [f"{v:{fmt}} {unit}" for v in vals]
+            if len(ok_results) == 2 and all(isinstance(v, (int, float)) for v in vals):
+                delta = vals[1] - vals[0]
+                if vals[0] != 0:
+                    pct = (delta / vals[0]) * 100
                     sign = "+" if delta > 0 else ""
-                    delta_str = f"{sign}{delta:{fmt}} {unit} ({sign}{pct:.1f}%)"
+                    cols.append(f"{sign}{delta:{fmt}} {unit} ({sign}{pct:.1f}%)")
                 else:
-                    delta_str = f"{delta:{fmt}} {unit}"
-                L.append(f"| {label} | {bv:{fmt}} {unit} | {ov:{fmt}} {unit} | {delta_str} |")
-            else:
-                L.append(f"| {label} | {bv} | {ov} | -- |")
+                    cols.append(f"{delta:{fmt}} {unit}")
+            L.append("| " + " | ".join(cols) + " |")
 
-        row("Total time", b.get("overall_time_s", 0), o.get("overall_time_s", 0), "s")
-        row("Effective FPS", b.get("effective_fps", 0), o.get("effective_fps", 0), "fps", fmt=".2f")
-        row("Avg frame time", b.get("avg_frame_ms", 0), o.get("avg_frame_ms", 0), "ms")
-        row("Median frame time", b.get("median_frame_ms", 0), o.get("median_frame_ms", 0), "ms")
-        row("Min frame time", b.get("min_frame_ms", 0), o.get("min_frame_ms", 0), "ms")
-        row("Max frame time", b.get("max_frame_ms", 0), o.get("max_frame_ms", 0), "ms")
+        comp_row("Total time", "overall_time_s", "s")
+        comp_row("Effective FPS", "effective_fps", "fps", fmt=".2f")
+        comp_row("Avg frame time", "avg_frame_ms", "ms")
+        comp_row("Median frame time", "median_frame_ms", "ms")
+        comp_row("Min frame time", "min_frame_ms", "ms")
+        comp_row("Max frame time", "max_frame_ms", "ms")
 
         L.append("")
         L.append("#### GPU Memory")
         L.append("")
-        L.append("| Metric | Flash Attention Only (Baseline) | All Optimizations | Delta |")
-        L.append("|---|---:|---:|---:|")
 
-        b_total_gpu = b.get("device_total_gpu_mb", 0)
-        o_total_gpu = o.get("device_total_gpu_mb", 0)
-        b_reserved = b.get("peak_vram_reserved_mb", 0)
-        o_reserved = o.get("peak_vram_reserved_mb", 0)
+        header_cols = ["Metric"] + [r["label"] for r in ok_results]
+        if len(ok_results) == 2:
+            header_cols.append("Delta")
+        L.append("| " + " | ".join(header_cols) + " |")
+        L.append("|---" + "|---:" * (len(header_cols) - 1) + "|")
 
-        row("Dedicated VRAM (physical)", b.get("device_peak_gpu_mb", 0), o.get("device_peak_gpu_mb", 0), "MB")
-        row("PyTorch allocator reserved", b_reserved, o_reserved, "MB")
-        row("Idle after model load", b.get("device_idle_gpu_mb", 0), o.get("device_idle_gpu_mb", 0), "MB")
-
-        # Calculate and show shared memory spillover
-        b_spillover = max(0, b_reserved - b_total_gpu)
-        o_spillover = max(0, o_reserved - o_total_gpu)
-
+        comp_row("Dedicated VRAM (physical)", "device_peak_gpu_mb", "MB")
+        comp_row("PyTorch allocator reserved", "peak_vram_reserved_mb", "MB")
+        comp_row("Idle after model load", "device_idle_gpu_mb", "MB")
         L.append("")
-        if b_spillover > 0 or o_spillover > 0:
-            L.append(f"> **Shared GPU memory spillover (system RAM):** The baseline's PyTorch allocator")
-            L.append(f"> reserved **{b_reserved:.0f} MB** but the GPU only has **{b_total_gpu:.0f} MB** of")
-            L.append(f"> dedicated VRAM — meaning **~{b_spillover:.0f} MB spilled into shared GPU memory**")
-            L.append(f"> (system RAM accessed over PCIe). This is drastically slower than dedicated VRAM")
-            L.append(f"> and is a major contributor to the baseline's poor performance. The device-level")
-            L.append(f"> peak is capped at {b_total_gpu:.0f} MB because `torch.cuda.mem_get_info()` cannot")
-            L.append(f"> see beyond physical VRAM.")
-            if o_spillover > 0:
-                L.append(f">")
-                L.append(f"> The optimized config also spilled **~{o_spillover:.0f} MB** into shared memory.")
-            else:
-                L.append(f">")
-                L.append(f"> The optimized config reserved only **{o_reserved:.0f} MB** — well within the")
-                L.append(f"> {o_total_gpu:.0f} MB physical VRAM with **{o_total_gpu - o_reserved:.0f} MB headroom**.")
-            L.append("")
-        else:
-            L.append(f"> Both configs fit within the {b_total_gpu:.0f} MB dedicated VRAM.")
-            L.append("")
 
         # Warmup analysis
-        if "first5_avg_ms" in b and "first5_avg_ms" in o:
+        if all("first5_avg_ms" in r for r in ok_results):
             L.append("### Warmup Effect (first 5 vs last 5 frames)")
             L.append("")
-            L.append("| | First 5 avg (ms) | Last 5 avg (ms) | Warmup overhead |")
+            L.append("| Profile | First 5 avg (ms) | Last 5 avg (ms) | Warmup overhead |")
             L.append("|---|---:|---:|---:|")
-            bf5, bl5 = b["first5_avg_ms"], b["last5_avg_ms"]
-            of5, ol5 = o["first5_avg_ms"], o["last5_avg_ms"]
-            bw = ((bf5 - bl5) / bl5 * 100) if bl5 else 0
-            ow = ((of5 - ol5) / ol5 * 100) if ol5 else 0
-            L.append(f"| Baseline | {bf5:.0f} | {bl5:.0f} | {bw:+.1f}% |")
-            L.append(f"| Optimized | {of5:.0f} | {ol5:.0f} | {ow:+.1f}% |")
+            for r in ok_results:
+                f5, l5 = r["first5_avg_ms"], r["last5_avg_ms"]
+                wo = ((f5 - l5) / l5 * 100) if l5 else 0
+                L.append(f"| {r['label']} | {f5:.0f} | {l5:.0f} | {wo:+.1f}% |")
             L.append("")
+
+    # --- Single profile results ---
+    else:
+        L.append("---")
+        L.append("")
+        L.append("## Results")
+        L.append("")
+
+        for r in ok_results:
+            L.append(f"### {r['label']}")
+            L.append("")
+            L.append("| Metric | Value |")
+            L.append("|---|---:|")
+            L.append(f"| Total time | {r.get('overall_time_s', 0):.1f} s |")
+            L.append(f"| Effective FPS | {r.get('effective_fps', 0):.2f} fps |")
+            L.append(f"| Avg frame time | {r.get('avg_frame_ms', 0):.1f} ms |")
+            L.append(f"| Median frame time | {r.get('median_frame_ms', 0):.1f} ms |")
+            L.append(f"| Min frame time | {r.get('min_frame_ms', 0):.1f} ms |")
+            L.append(f"| Max frame time | {r.get('max_frame_ms', 0):.1f} ms |")
+            L.append("")
+            L.append("#### GPU Memory")
+            L.append("")
+            L.append("| Metric | Value |")
+            L.append("|---|---:|")
+            L.append(f"| Dedicated VRAM (physical) | {r.get('device_peak_gpu_mb', 0):.1f} MB |")
+            L.append(f"| PyTorch allocator reserved | {r.get('peak_vram_reserved_mb', 0):.1f} MB |")
+            L.append(f"| Idle after model load | {r.get('device_idle_gpu_mb', 0):.1f} MB |")
+            L.append(f"| Model load time | {r.get('load_time_ms', 0):.0f} ms |")
+
+            total_gpu = r.get("device_total_gpu_mb", 0)
+            reserved = r.get("peak_vram_reserved_mb", 0)
+            spillover = max(0, reserved - total_gpu)
+            L.append("")
+            if spillover > 0:
+                L.append(f"> **Shared GPU memory spillover**: PyTorch reserved **{reserved:.0f} MB** but the GPU")
+                L.append(f"> only has **{total_gpu:.0f} MB** dedicated VRAM — **~{spillover:.0f} MB spilled into")
+                L.append(f"> shared GPU memory** (system RAM over PCIe).")
+            else:
+                headroom = total_gpu - reserved
+                L.append(f"> Fits within **{total_gpu:.0f} MB** dedicated VRAM with **{headroom:.0f} MB headroom**.")
+            L.append("")
+
+            if "first5_avg_ms" in r:
+                f5, l5 = r["first5_avg_ms"], r["last5_avg_ms"]
+                wo = ((f5 - l5) / l5 * 100) if l5 else 0
+                L.append(f"#### Warmup (first 5 avg: {f5:.0f} ms, last 5 avg: {l5:.0f} ms, overhead: {wo:+.1f}%)")
+                L.append("")
 
     # --- Output files ---
     L.append("---")
     L.append("")
     L.append("## Output Files")
     L.append("")
-    for r in results:
-        if r.get("status") == "OK":
-            L.append(f"### {r['label']}")
-            L.append("")
-            L.append(f"- **Composite**: `{r.get('comp_output', 'N/A')}`")
-            L.append(f"- **Alpha matte**: `{r.get('alpha_output', 'N/A')}`")
-            L.append("")
+    for r in ok_results:
+        L.append(f"### {r['label']}")
+        L.append("")
+        L.append(f"- **Composite**: `{r.get('comp_output', 'N/A')}`")
+        L.append(f"- **Alpha matte**: `{r.get('alpha_output', 'N/A')}`")
+        L.append("")
 
-    L.append("> Compare the composite and alpha EXR sequences side-by-side to evaluate quality")
-    L.append("> differences between baseline (no tiled refiner) and optimized (tiled refiner).")
     L.append("> Output is linear premultiplied RGBA EXR — ready for compositing in Nuke/Fusion/etc.")
-    L.append("> The tiled refiner processes the CNN in 512x512 overlapping tiles, which may")
-    L.append("> introduce subtle differences at tile boundaries.")
     L.append("")
 
-    # --- Detailed config info ---
+    # --- Configuration details ---
     L.append("---")
     L.append("")
     L.append("## Configuration Details")
     L.append("")
-    for r in results:
-        if r.get("status") != "OK":
-            continue
+    for r in ok_results:
         L.append(f"### {r['label']}")
         L.append("")
         L.append(f"- **Config**: {r.get('config_summary', 'N/A')}")
@@ -533,48 +571,65 @@ def generate_report(results: list[dict], gpu_info: str) -> str:
         L.append(f"- **Wall time (incl. subprocess)**: {r.get('wall_time_s', 0):.1f} s")
         L.append("")
 
-    # --- Analysis ---
-    L.append("---")
-    L.append("")
-    L.append("## Analysis")
-    L.append("")
-
-    if baseline and optimized and baseline.get("status") == "OK" and optimized.get("status") == "OK":
-        b_time = baseline.get("overall_time_s", 1)
-        o_time = optimized.get("overall_time_s", 1)
-        b_reserved = baseline.get("peak_vram_reserved_mb", 0)
-        o_reserved = optimized.get("peak_vram_reserved_mb", 0)
-        b_fps = baseline.get("effective_fps", 0)
-        o_fps = optimized.get("effective_fps", 0)
-        reserved_reduction = ((b_reserved - o_reserved) / b_reserved * 100) if b_reserved else 0
-        speedup = ((b_time - o_time) / b_time * 100) if b_time else 0
-
-        L.append(f"Processing {NUM_FRAMES} frames of 4K EXR footage (Tears of Steel):")
-        L.append(f"")
-        L.append(f"- **Speed**: {o_fps:.2f} fps optimized vs {b_fps:.2f} fps baseline "
-                 f"({'faster' if o_time < b_time else 'slower'} by {abs(speedup):.1f}%)")
-        L.append(f"- **Reserved VRAM**: {o_reserved:.0f} MB optimized vs {b_reserved:.0f} MB baseline "
-                 f"(**-{reserved_reduction:.0f}%**)")
-        L.append(f"- **Total time**: {o_time:.1f}s optimized vs {b_time:.1f}s baseline")
-        L.append(f"")
-        L.append(f"The optimizations reduce CUDA reserved memory by **{reserved_reduction:.0f}%** while ")
-
-        if o_time < b_time:
-            L.append(f"also being **{abs(speedup):.1f}% faster** over sustained multi-frame processing.")
-        else:
-            L.append(f"adding {abs(speedup):.1f}% overhead from tiled refiner processing.")
-
-        L.append("")
-
     return "\n".join(L)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="CorridorKey 4K Benchmark — Tears of Steel",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--profile",
+        nargs="+",
+        choices=["baseline", "optimized", "v2", "all"],
+        default=["v2"],
+        help="Profile(s) to benchmark. Use 'all' to run baseline + optimized + v2. "
+             "Specify multiple to compare (e.g. --profile baseline v2). Default: v2",
+    )
+    parser.add_argument(
+        "--frames",
+        type=int,
+        default=100,
+        help="Number of frames to process (default: 100)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=OUTPUT_DIR,
+        help=f"Output directory for EXR sequences (default: {OUTPUT_DIR})",
+    )
+    parser.add_argument(
+        "--report",
+        default=REPORT_PATH,
+        help=f"Path for the markdown report (default: {REPORT_PATH})",
+    )
+    return parser.parse_args()
 
 
 def main():
     import shutil
-    if os.path.exists(OUTPUT_DIR):
-        shutil.rmtree(OUTPUT_DIR)
-        print(f"Cleared {OUTPUT_DIR}/")
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    args = parse_args()
+    num_frames = args.frames
+    output_dir = args.output_dir
+    report_path = args.report
+
+    # Expand "all" into individual profiles
+    profiles: list[str] = []
+    for p in args.profile:
+        if p == "all":
+            profiles.extend(["baseline", "optimized", "v2"])
+        elif p not in profiles:
+            profiles.append(p)
+
+    # Update globals used by run_config
+    global OUTPUT_DIR
+    OUTPUT_DIR = output_dir
+
+    if os.path.exists(output_dir):
+        shutil.rmtree(output_dir)
+        print(f"Cleared {output_dir}/")
+    os.makedirs(output_dir, exist_ok=True)
 
     if not os.path.isfile(CKPT):
         print(f"ERROR: Checkpoint not found: {CKPT}")
@@ -583,11 +638,11 @@ def main():
         print(f"ERROR: Frames directory not found: {FRAMES_DIR}")
         print("Run: uv run python tears_of_steel_test/download_frames.py")
         sys.exit(1)
-    # Count available frames
+
     import glob as _glob
     available_frames = len(_glob.glob(os.path.join(FRAMES_DIR, "*.exr")))
-    if available_frames < NUM_FRAMES:
-        print(f"WARNING: Only {available_frames} EXR frames available (need {NUM_FRAMES})")
+    if available_frames < num_frames:
+        print(f"WARNING: Only {available_frames} EXR frames available (need {num_frames})")
         print("Run: uv run python tears_of_steel_test/download_frames.py")
     if not os.path.isdir(HINT_DIR):
         print(f"ERROR: Alpha hint directory not found: {HINT_DIR}")
@@ -612,22 +667,24 @@ def main():
     print(f"  GPU: {gpu_info}")
     print(f"  Frames: {available_frames} EXR frames ({FRAMES_DIR})")
     print(f"  Alpha hints: {hint_count} ({HINT_DIR})")
-    print(f"  Configs: {len(CONFIGS)}")
+    print(f"  Profiles: {', '.join(profiles)}")
+    print(f"  Frame count: {num_frames}")
     print("=" * 60)
 
     results = []
-    for label, config_fields, tag in CONFIGS:
-        result = run_config(label, config_fields, tag)
-        result["tag"] = tag
+    for profile_name in profiles:
+        label, config_fields = PROFILE_CONFIGS[profile_name]
+        result = run_config(label, config_fields, profile_name, num_frames)
+        result["tag"] = profile_name
         results.append(result)
 
-    report = generate_report(results, gpu_info)
-    with open(REPORT_PATH, "w", encoding="utf-8") as f:
+    report = generate_report(results, gpu_info, num_frames)
+    with open(report_path, "w", encoding="utf-8") as f:
         f.write(report)
 
     print(f"\n\n{'='*60}")
     print(f"  BENCHMARK COMPLETE")
-    print(f"  Report: {REPORT_PATH}")
+    print(f"  Report: {report_path}")
     print(f"{'='*60}\n")
 
     for r in results:

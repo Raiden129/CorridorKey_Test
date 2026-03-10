@@ -55,6 +55,47 @@ class _BaseCorridorKeyEngine(ABC):
 
         self.model = self._load_model()
 
+        # Apply channels_last memory format for faster CUDA convolutions
+        if self.device.type == "cuda":
+            self.model = self.model.to(memory_format=torch.channels_last)
+
+        # Optional torch.compile on sub-modules
+        if self.config.compile_submodules and self.device.type == "cuda":
+            self._compile_submodules()
+
+    def _compile_submodules(self) -> None:
+        """Apply torch.compile to encoder, decoders, and refiner sub-modules.
+
+        Compiling sub-modules individually avoids graph breaks from the
+        orchestration code (cache clearing, tiling loops, conditional
+        refiner scaling) while still fusing Conv-GroupNorm-ReLU chains
+        and transformer block internals.
+
+        CUDA graphs are disabled because Hiera's ``forward_intermediates``
+        stores intermediate tensors that get overwritten on graph replay.
+        Triton kernel fusion still applies without CUDA graphs.
+        """
+        import torch._dynamo
+        import torch._inductor.config as inductor_config
+
+        torch._dynamo.config.suppress_errors = True  # graceful fallback to eager
+        inductor_config.triton.cudagraphs = False  # disable CUDA graphs globally
+
+        self.model.encoder = torch.compile(self.model.encoder)
+        self.model.alpha_decoder = torch.compile(self.model.alpha_decoder)
+        self.model.fg_decoder = torch.compile(self.model.fg_decoder)
+
+        if hasattr(self.model, "refiner") and self.model.refiner is not None:
+            if hasattr(self.model.refiner, "_process_tile"):
+                # TiledCNNRefiner: compile the per-tile processing, not the tiling loop
+                self.model.refiner._process_tile = torch.compile(
+                    self.model.refiner._process_tile
+                )
+            else:
+                self.model.refiner = torch.compile(self.model.refiner)
+
+        print("[Optimized] torch.compile (no CUDA graphs) applied to encoder, decoders, and refiner.")
+
     # ------------------------------------------------------------------
     # Subclass hooks
     # ------------------------------------------------------------------
@@ -137,7 +178,7 @@ class _BaseCorridorKeyEngine(ABC):
     # Frame processing (shared -- THE single implementation)
     # ------------------------------------------------------------------
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def process_frame(
         self,
         image: np.ndarray,
@@ -198,14 +239,14 @@ class _BaseCorridorKeyEngine(ABC):
         inp_np = np.concatenate([img_norm, mask_resized], axis=-1)  # [H, W, 4]
         inp_t = torch.from_numpy(inp_np.transpose((2, 0, 1))).float().unsqueeze(0).to(self.device)
 
+        # Apply channels_last for faster CUDA convolutions
+        if self.device.type == "cuda":
+            inp_t = inp_t.to(memory_format=torch.channels_last)
+
         # === 5. Inference ===
-        handle = None
-        if refiner_scale != 1.0 and self.model.refiner is not None:
-
-            def scale_hook(module, input, output):
-                return output * refiner_scale
-
-            handle = self.model.refiner.register_forward_hook(scale_hook)
+        # Cache clearing before inference (moved from model forward to engine level)
+        if self.config.cache_clearing and self.device.type == "cuda":
+            torch.cuda.empty_cache()
 
         if metrics is not None:
             ctx = metrics.measure("inference", self.device)
@@ -216,10 +257,11 @@ class _BaseCorridorKeyEngine(ABC):
 
         with ctx:
             with torch.autocast(device_type=self.device.type, dtype=torch.float16):
-                out = self.model(inp_t)
+                out = self.model(inp_t, refiner_scale=refiner_scale)
 
-        if handle:
-            handle.remove()
+        # Cache clearing after inference
+        if self.config.cache_clearing and self.device.type == "cuda":
+            torch.cuda.empty_cache()
 
         pred_alpha = out["alpha"]
         pred_fg = out["fg"]

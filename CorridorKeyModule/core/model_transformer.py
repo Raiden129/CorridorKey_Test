@@ -268,6 +268,7 @@ class GreenFormer(nn.Module):
                     out_channels=4,
                     tile_size=self.config.tile_size,
                     tile_overlap=self.config.tile_overlap,
+                    sparse=self.config.sparse_refiner,
                 )
                 print(
                     f"[Optimized] Using TiledCNNRefiner "
@@ -292,62 +293,64 @@ class GreenFormer(nn.Module):
         features: list[torch.Tensor],
         x: torch.Tensor,
         input_size: tuple[int, ...],
+        refiner_scale: float = 1.0,
     ) -> dict[str, torch.Tensor]:
         """Shared decode -> upsample -> sigmoid -> refine -> sigmoid.
 
         Called by :meth:`forward` and overridden encoder paths in
         ``OptimizedGreenFormer``.
+
+        Uses in-place operations (``.add_()``, ``.sigmoid_()``) and
+        explicit ``del`` statements to minimise peak activation memory.
+        Requires ``torch.inference_mode()`` or ``torch.no_grad()`` context.
         """
-        # Decode
+        # Decode at H/4 resolution
         alpha_logits = self.alpha_decoder(features)
         fg_logits = self.fg_decoder(features)
 
         # Upsample to full resolution
         alpha_logits_up = F.interpolate(alpha_logits, size=input_size, mode="bilinear", align_corners=False)
         fg_logits_up = F.interpolate(fg_logits, size=input_size, mode="bilinear", align_corners=False)
+        del alpha_logits, fg_logits  # Free H/4 tensors
 
         # Coarse probs (for refiner input)
         alpha_coarse = torch.sigmoid(alpha_logits_up)
         fg_coarse = torch.sigmoid(fg_logits_up)
 
-        # Cache clearing before refiner
-        if self.config.cache_clearing and x.is_cuda:
-            torch.cuda.empty_cache()
-
-        # Refine
+        # Build refiner input and free coarse probs
         rgb = x[:, :3, :, :]
         coarse_pred = torch.cat([alpha_coarse, fg_coarse], dim=1)
+        del alpha_coarse, fg_coarse
 
         if self.use_refiner and self.refiner is not None:
             delta_logits = self.refiner(rgb, coarse_pred)
         else:
             delta_logits = torch.zeros_like(coarse_pred)
+        del coarse_pred
 
-        delta_alpha = delta_logits[:, 0:1]
-        delta_fg = delta_logits[:, 1:4]
+        # Apply refiner scale in-place
+        if refiner_scale != 1.0:
+            delta_logits.mul_(refiner_scale)
 
-        # Residual addition in logit space
-        alpha_final_logits = alpha_logits_up + delta_alpha
-        fg_final_logits = fg_logits_up + delta_fg
+        # In-place residual addition in logit space
+        alpha_logits_up.add_(delta_logits[:, 0:1])
+        fg_logits_up.add_(delta_logits[:, 1:4])
+        del delta_logits
 
-        # Final activation
-        alpha_final = torch.sigmoid(alpha_final_logits)
-        fg_final = torch.sigmoid(fg_final_logits)
+        # In-place final activation
+        alpha_logits_up.sigmoid_()
+        fg_logits_up.sigmoid_()
 
-        return {"alpha": alpha_final, "fg": fg_final}
+        return {"alpha": alpha_logits_up, "fg": fg_logits_up}
 
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
 
-    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward(self, x: torch.Tensor, refiner_scale: float = 1.0) -> dict[str, torch.Tensor]:
         input_size = x.shape[2:]
 
         # Encode
         features = self.encoder(x)
 
-        # Cache clearing between encoder and decoder
-        if self.config.cache_clearing and x.is_cuda:
-            torch.cuda.empty_cache()
-
-        return self._decode_and_refine(features, x, input_size)
+        return self._decode_and_refine(features, x, input_size, refiner_scale=refiner_scale)

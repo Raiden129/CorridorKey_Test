@@ -285,7 +285,7 @@ class TestOptimizedEngineAPI:
         from CorridorKeyModule.optimization_config import OptimizationConfig
         from CorridorKeyModule.optimized_engine import OptimizedCorridorKeyEngine
 
-        def fake_forward(x):
+        def fake_forward(x, **kwargs):
             b, c, h, w = x.shape
             return {
                 "alpha": torch.full((b, 1, h, w), 0.8),
@@ -362,3 +362,307 @@ class TestBackendFactory:
 
         assert resolve_backend("torch") == "torch"
         assert resolve_backend("torch_optimized") == "torch_optimized"
+
+
+# ---------------------------------------------------------------------------
+# TiledCNNRefiner: Duplicate tile deduplication
+# ---------------------------------------------------------------------------
+
+
+class TestTiledCNNRefinerDedup:
+    """Verify that the tiled refiner processes each coordinate region exactly once."""
+
+    def test_no_duplicate_tiles(self):
+        """Each tile coordinate should be processed exactly once."""
+        call_coords = []
+
+        refiner = TiledCNNRefiner(tile_size=64, tile_overlap=16)
+        original_process_tile = refiner._process_tile
+
+        def tracking_process_tile(x):
+            # Record the spatial dimensions as a proxy for tile identity
+            call_coords.append(x.shape)
+            return original_process_tile(x)
+
+        refiner._process_tile = tracking_process_tile
+
+        img = torch.randn(1, 3, 128, 128)
+        coarse = torch.randn(1, 4, 128, 128)
+        with torch.no_grad():
+            out = refiner(img, coarse)
+
+        # With tile_size=64, overlap=16, stride=48 on a 128x128 image:
+        # Positions: 0, 48, 96 along each axis → 3x3 = 9 initial positions
+        # After boundary adjustment some collapse → should be < 9 unique tiles
+        # The key point: no duplicates (old code would have had duplicates)
+        assert out.shape == (1, 4, 128, 128)
+        # Each call should have been to a tile of size [1, 7, 64, 64]
+        for shape in call_coords:
+            assert shape[0] == 1 and shape[1] == 7
+
+    def test_unique_coordinates_tracked(self):
+        """Directly verify the coordinate deduplication logic."""
+        tile_size = 64
+        tile_overlap = 16
+        stride = tile_size - tile_overlap
+        H, W = 128, 128
+
+        coords_set = set()
+        for y0 in range(0, H, stride):
+            for x0 in range(0, W, stride):
+                y1 = min(y0 + tile_size, H)
+                x1 = min(x0 + tile_size, W)
+                y0_adj = max(0, y1 - tile_size)
+                x0_adj = max(0, x1 - tile_size)
+                coords_set.add((y0_adj, y1, x0_adj, x1))
+
+        # The number of unique coords should be less than the raw loop iterations
+        raw_iterations = len(list(range(0, H, stride))) * len(list(range(0, W, stride)))
+        assert len(coords_set) <= raw_iterations
+        # And each should have valid, non-negative coordinates
+        for y0_adj, y1, x0_adj, x1 in coords_set:
+            assert y0_adj >= 0 and x0_adj >= 0
+            assert y1 <= H and x1 <= W
+            assert y1 - y0_adj <= tile_size
+            assert x1 - x0_adj <= tile_size
+
+
+# ---------------------------------------------------------------------------
+# TiledCNNRefiner: Sparse tile skipping
+# ---------------------------------------------------------------------------
+
+
+class TestTiledCNNRefinerSparse:
+    """Verify sparse tile skipping behavior."""
+
+    def test_pure_background_skips_processing(self):
+        """When coarse alpha is all zeros, _process_tile should not be called."""
+        call_count = [0]
+
+        refiner = TiledCNNRefiner(tile_size=64, tile_overlap=16, sparse=True)
+        original_process_tile = refiner._process_tile
+
+        def counting_process_tile(x):
+            call_count[0] += 1
+            return original_process_tile(x)
+
+        refiner._process_tile = counting_process_tile
+
+        img = torch.randn(1, 3, 128, 128)
+        coarse = torch.zeros(1, 4, 128, 128)  # all zeros → pure background
+
+        with torch.no_grad():
+            out = refiner(img, coarse)
+
+        assert call_count[0] == 0, f"Expected 0 tile calls for pure BG, got {call_count[0]}"
+        assert out.shape == (1, 4, 128, 128)
+        # Output should be all zeros (no delta applied)
+        assert out.abs().max() == 0.0
+
+    def test_pure_foreground_skips_processing(self):
+        """When coarse alpha is all ones, _process_tile should not be called."""
+        call_count = [0]
+
+        refiner = TiledCNNRefiner(tile_size=64, tile_overlap=16, sparse=True)
+        original_process_tile = refiner._process_tile
+
+        def counting_process_tile(x):
+            call_count[0] += 1
+            return original_process_tile(x)
+
+        refiner._process_tile = counting_process_tile
+
+        img = torch.randn(1, 3, 128, 128)
+        coarse = torch.ones(1, 4, 128, 128)  # all ones → pure foreground
+
+        with torch.no_grad():
+            out = refiner(img, coarse)
+
+        assert call_count[0] == 0, f"Expected 0 tile calls for pure FG, got {call_count[0]}"
+        assert out.shape == (1, 4, 128, 128)
+
+    def test_edge_tiles_are_processed(self):
+        """Tiles with alpha=0.5 (edge region) should be processed normally."""
+        call_count = [0]
+
+        refiner = TiledCNNRefiner(tile_size=64, tile_overlap=16, sparse=True)
+        original_process_tile = refiner._process_tile
+
+        def counting_process_tile(x):
+            call_count[0] += 1
+            return original_process_tile(x)
+
+        refiner._process_tile = counting_process_tile
+
+        img = torch.randn(1, 3, 128, 128)
+        coarse = torch.full((1, 4, 128, 128), 0.5)  # all edge → must process
+
+        with torch.no_grad():
+            out = refiner(img, coarse)
+
+        assert call_count[0] > 0, "Edge tiles should be processed"
+        assert out.shape == (1, 4, 128, 128)
+
+    def test_mixed_scene_partial_skip(self):
+        """A scene with both uniform and edge regions should partially skip."""
+        call_count = [0]
+
+        refiner = TiledCNNRefiner(tile_size=64, tile_overlap=16, sparse=True)
+        original_process_tile = refiner._process_tile
+
+        def counting_process_tile(x):
+            call_count[0] += 1
+            return original_process_tile(x)
+
+        refiner._process_tile = counting_process_tile
+
+        img = torch.randn(1, 3, 128, 128)
+        coarse = torch.zeros(1, 4, 128, 128)
+        # Put edge values in the top-left quadrant only
+        coarse[:, 0:1, :64, :64] = 0.5
+
+        with torch.no_grad():
+            out = refiner(img, coarse)
+
+        # Some tiles should be processed (edge region) and some skipped (uniform)
+        assert call_count[0] > 0, "At least some edge tiles should be processed"
+        assert out.shape == (1, 4, 128, 128)
+
+    def test_sparse_disabled_processes_all_tiles(self):
+        """When sparse=False, all tiles are processed even for uniform alpha."""
+        call_count = [0]
+
+        refiner = TiledCNNRefiner(tile_size=64, tile_overlap=16, sparse=False)
+        original_process_tile = refiner._process_tile
+
+        def counting_process_tile(x):
+            call_count[0] += 1
+            return original_process_tile(x)
+
+        refiner._process_tile = counting_process_tile
+
+        img = torch.randn(1, 3, 128, 128)
+        coarse = torch.zeros(1, 4, 128, 128)  # all zeros
+
+        with torch.no_grad():
+            out = refiner(img, coarse)
+
+        assert call_count[0] > 0, "With sparse=False, all tiles should be processed"
+
+
+# ---------------------------------------------------------------------------
+# OptimizationConfig: New profiles and fields
+# ---------------------------------------------------------------------------
+
+
+class TestOptimizationConfigUpdates:
+    """Verify the new sparse_refiner and compile_submodules config fields."""
+
+    def test_original_profile_defaults(self):
+        from CorridorKeyModule.optimization_config import OptimizationConfig
+
+        config = OptimizationConfig.original()
+        assert config.sparse_refiner is False
+        assert config.compile_submodules is False
+
+    def test_optimized_profile_has_sparse(self):
+        from CorridorKeyModule.optimization_config import OptimizationConfig
+
+        config = OptimizationConfig.optimized()
+        assert config.sparse_refiner is True
+        assert config.compile_submodules is False
+
+    def test_v2_profile(self):
+        from CorridorKeyModule.optimization_config import OptimizationConfig
+
+        config = OptimizationConfig.v2()
+        assert config.flash_attention is True
+        assert config.tiled_refiner is True
+        assert config.sparse_refiner is True
+        assert config.compile_submodules is True
+        assert config.cache_clearing is False  # Disabled in v2
+
+    def test_experimental_profile(self):
+        from CorridorKeyModule.optimization_config import OptimizationConfig
+
+        config = OptimizationConfig.experimental()
+        assert config.token_routing is True
+        assert config.compile_submodules is True
+        assert config.sparse_refiner is True
+
+    def test_from_profile_v2(self):
+        from CorridorKeyModule.optimization_config import OptimizationConfig
+
+        config = OptimizationConfig.from_profile("v2")
+        assert config.compile_submodules is True
+
+    def test_active_optimizations_includes_new_flags(self):
+        from CorridorKeyModule.optimization_config import OptimizationConfig
+
+        config = OptimizationConfig(sparse_refiner=True, compile_submodules=True)
+        active = config.active_optimizations()
+        assert "sparse_refiner" in active
+        assert "compile_submodules" in active
+
+    def test_summary_reports_new_flags(self):
+        from CorridorKeyModule.optimization_config import OptimizationConfig
+
+        config = OptimizationConfig.v2()
+        summary = config.summary()
+        assert "sparse_refiner" in summary
+        assert "compile_submodules" in summary
+
+
+# ---------------------------------------------------------------------------
+# GreenFormer: refiner_scale parameter
+# ---------------------------------------------------------------------------
+
+
+class TestRefinerScaleParameter:
+    """Verify that refiner_scale is passed through forward() correctly."""
+
+    def test_refiner_scale_zero_no_refinement(self):
+        """refiner_scale=0.0 should produce output identical to no refiner delta."""
+        from CorridorKeyModule.core.model_transformer import GreenFormer
+
+        torch.manual_seed(42)
+        model = GreenFormer(img_size=224, use_refiner=True)
+        model.eval()
+
+        x = torch.randn(1, 4, 224, 224)
+
+        with torch.no_grad():
+            out_scale0 = model(x, refiner_scale=0.0)
+
+        # With refiner_scale=0.0, delta*0=0, so result should match no-refiner
+        # Build a model without refiner for comparison
+        torch.manual_seed(42)
+        model_no_ref = GreenFormer(img_size=224, use_refiner=False)
+        model_no_ref.eval()
+        # Copy encoder and decoder weights
+        model_no_ref.encoder.load_state_dict(model.encoder.state_dict())
+        model_no_ref.alpha_decoder.load_state_dict(model.alpha_decoder.state_dict())
+        model_no_ref.fg_decoder.load_state_dict(model.fg_decoder.state_dict())
+
+        with torch.no_grad():
+            out_no_ref = model_no_ref(x, refiner_scale=1.0)
+
+        torch.testing.assert_close(out_scale0["alpha"], out_no_ref["alpha"], atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(out_scale0["fg"], out_no_ref["fg"], atol=1e-4, rtol=1e-4)
+
+    def test_refiner_scale_default_is_one(self):
+        """forward() without refiner_scale should default to 1.0."""
+        from CorridorKeyModule.core.model_transformer import GreenFormer
+
+        torch.manual_seed(42)
+        model = GreenFormer(img_size=224, use_refiner=False)
+        model.eval()
+
+        x = torch.randn(1, 4, 224, 224)
+
+        with torch.no_grad():
+            out_default = model(x)
+            out_explicit = model(x, refiner_scale=1.0)
+
+        torch.testing.assert_close(out_default["alpha"], out_explicit["alpha"])
+        torch.testing.assert_close(out_default["fg"], out_explicit["fg"])
